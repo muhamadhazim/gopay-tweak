@@ -1,5 +1,20 @@
-// LCIsolator v2 - tanpa Dobby/JIT (pakai fishhook), dengan log ke file.
+// LCIsolator v6 - tanpa Dobby/JIT (pakai fishhook), dengan log ke file.
 // Log: <container>/Documents/lcisolator.log
+//
+// Perubahan v6 (perbaikan logout GoPay, hasil bedah IPA GoPay 2.23.3):
+//  1. Fake keychain sekarang MEMBEDAKAN kSecAttrAccessGroup & kSecAttrSynchronizable.
+//     GoPay memakai 3 access group (gojekSharedKeychain, gojekSharedKeychainBiometric,
+//     gotoSharedKeychain) dan GotoLoginSSO punya delete(accessGroup:)/deleteAll(accessGroup:).
+//     Dulu group diabaikan -> hapus satu group = hapus token di SEMUA group,
+//     dan item dengan service/account sama di group beda dianggap duplikat.
+//  2. IDFV dibuat sekali (thread-safe, dispatch_once) lalu disimpan ke FILE, bukan
+//     NSUserDefaults. login_sdk memakai IDFV sebagai clientDeviceId yang ikut disimpan
+//     bersama token; kalau IDFV berubah antar launch/thread, token dianggap tidak valid.
+//  3. Container ID dikunci ke file (Library/lc_container_id) supaya nama file keychain,
+//     IDFV, dan WebView store tidak berubah antar launch. File keychain versi lama
+//     (lc_fake_keychain_*.plist) dimigrasikan otomatis.
+//  4. Log Delete sekarang mencatat group/service/account, supaya kelihatan siapa
+//     yang menghapus sesi.
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -18,6 +33,9 @@
 #define LC_ENABLE_KEYCHAIN  1
 #define LC_BLOCK_PASTEBOARD 1   // 0 kalau paste di app jadi tidak bisa
 #define LC_CRASH_LOG        1
+
+// Access group default = group PERTAMA di entitlement GoPay (tanpa prefix Team ID).
+#define LC_DEFAULT_KC_GROUP @"gojekSharedKeychain"
 
 #pragma mark - Logging (ke file, supaya kelihatan tanpa Console)
 
@@ -62,15 +80,34 @@ static void crashException(NSException *e) {
 
 #pragma mark - Container helpers
 
+static NSString *libPath(NSString *name) {
+    NSString *lib = [NSHomeDirectory() stringByAppendingPathComponent:@"Library"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:lib
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    return name.length ? [lib stringByAppendingPathComponent:name] : lib;
+}
+
+static NSString *readTrimmed(NSString *path) {
+    NSString *s = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    return [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+// Container ID dikunci ke file pada launch pertama, jadi tidak bisa "bergeser"
+// antar launch (itu penyebab keychain/IDFV tiba-tiba kosong -> logout).
 static NSString *getContainerID(void) {
     static NSString *cid; static dispatch_once_t t;
     dispatch_once(&t, ^{
+        NSString *idFile = libPath(@"lc_container_id");
+        NSString *saved = readTrimmed(idFile);
+        if (saved.length) { cid = saved; return; }
+
         id v = [NSBundle mainBundle].infoDictionary[@"LCDataUUID"];
         if (![v isKindOfClass:[NSString class]] || ![v length])
             v = [[NSUserDefaults standardUserDefaults] stringForKey:@"LC_ActiveContainerName"];
         if (![v isKindOfClass:[NSString class]] || ![v length])
             v = NSHomeDirectory().lastPathComponent;   // folder data container unik per container
         cid = [v length] ? v : @"DefaultContainer";
+        [cid writeToFile:idFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
     });
     return cid;
 }
@@ -87,12 +124,59 @@ static NSUUID *uuidFromString(NSString *s) {
     return [[NSUUID alloc] initWithUUIDBytes:h];
 }
 
+// IDFV palsu: dibuat SEKALI, thread-safe, disimpan di file (atomic).
+// Migrasi: pakai nilai lama dari NSUserDefaults (v5 ke bawah) kalau ada,
+// supaya deviceId yang sudah terlanjur tersimpan bersama token tetap cocok.
+static NSUUID *fakeIDFV(void) {
+    static NSUUID *u; static dispatch_once_t t;
+    dispatch_once(&t, ^{
+        NSString *file = libPath(@"lc_idfv.txt");
+        NSString *v = readTrimmed(file);
+        if (!v.length) {
+            NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+            v = [d stringForKey:[NSString stringWithFormat:@"LC_FakeIDFV_%@", getContainerID()]];
+            if (!v.length) {
+                for (NSString *k in [d dictionaryRepresentation]) {
+                    if ([k hasPrefix:@"LC_FakeIDFV_"]) {
+                        NSString *cand = [d stringForKey:k];
+                        if (cand.length) { v = cand; break; }
+                    }
+                }
+            }
+        }
+        if (v.length && ![[NSUUID alloc] initWithUUIDString:v]) v = nil;
+        if (!v.length) v = [[NSUUID UUID] UUIDString];
+        [v writeToFile:file atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        u = [[NSUUID alloc] initWithUUIDString:v];
+        LCLog(@"IDFV = %@", v);
+    });
+    return u;
+}
+
 static NSString *fakeKeychainPath(void) {
-    NSString *lib = [NSHomeDirectory() stringByAppendingPathComponent:@"Library"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:lib
-                              withIntermediateDirectories:YES attributes:nil error:nil];
-    return [lib stringByAppendingPathComponent:
-            [NSString stringWithFormat:@"lc_fake_keychain_%@.plist", getContainerID()]];
+    static NSString *p; static dispatch_once_t t;
+    dispatch_once(&t, ^{
+        NSString *lib = libPath(@"");
+        p = [lib stringByAppendingPathComponent:
+             [NSString stringWithFormat:@"lc_fake_keychain_%@.plist", getContainerID()]];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:p]) {
+            // Migrasi dari file keychain versi lama yang namanya beda (ID bergeser).
+            NSString *best = nil; NSDate *bestDate = nil;
+            for (NSString *f in [fm contentsOfDirectoryAtPath:lib error:nil]) {
+                if (![f hasPrefix:@"lc_fake_keychain_"] || ![f hasSuffix:@".plist"]) continue;
+                NSString *full = [lib stringByAppendingPathComponent:f];
+                NSDate *m = [fm attributesOfItemAtPath:full error:nil][NSFileModificationDate];
+                if (!m) m = [NSDate distantPast];
+                if (!bestDate || [m compare:bestDate] == NSOrderedDescending) { best = full; bestDate = m; }
+            }
+            if (best) {
+                [fm copyItemAtPath:best toPath:p error:nil];
+                LCLog(@"keychain dimigrasi dari %@", best.lastPathComponent);
+            }
+        }
+    });
+    return p;
 }
 
 static void swizzleMethod(Class cls, SEL origSel, SEL newSel) {
@@ -119,14 +203,7 @@ static void swizzleClassMethod(Class cls, SEL o, SEL n) {
 
 @implementation UIDevice (LCIsolation)
 - (NSUUID *)lc_identifierForVendor {
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    NSString *k = [NSString stringWithFormat:@"LC_FakeIDFV_%@", getContainerID()];
-    NSString *v = [d stringForKey:k];
-    if (!v) {
-        v = [[NSUUID UUID] UUIDString];
-        [d setObject:v forKey:k];
-    }
-    return [[NSUUID alloc] initWithUUIDString:v];
+    return fakeIDFV();
 }
 @end
 
@@ -162,7 +239,7 @@ static WKWebsiteDataStore *isolatedStore(void) {
 }
 @end
 
-// App group (group.com.go-jek.ios.shared / .files) diarahkan ke folder
+// App group (group.com.go-jek.gopay.files) diarahkan ke folder
 // milik container ini sendiri, supaya tidak ada folder yang dipakai bersama.
 @implementation NSFileManager (LCIsolation)
 - (NSURL *)lc_containerURLForSecurityApplicationGroupIdentifier:(NSString *)gid {
@@ -263,18 +340,19 @@ static BOOL isPasswordClass(NSDictionary *d) {
            [c isEqual:(__bridge id)kSecClassInternetPassword];
 }
 
-static NSMutableDictionary *kcStore(void) {   // panggil di dalam @synchronized
-    if (!gKC) {
-        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:fakeKeychainPath()];
-        gKC = d ? [d mutableCopy] : [NSMutableDictionary dictionary];
-        LCLog(@"keychain loaded, %lu item", (unsigned long)gKC.count);
-    }
-    return gKC;
+// ---- Access group & synchronizable (inti perbaikan v6) ----
+// Team ID di-buang (GF3689X945.gojekSharedKeychain -> gojekSharedKeychain) karena
+// prefix itu berubah setelah di-resign. Tanpa group = group default (entitlement pertama).
+static NSString *normGroup(id g) {
+    if (![g isKindOfClass:[NSString class]] || ![g length]) return LC_DEFAULT_KC_GROUP;
+    NSString *s = g;
+    NSRange r = [s rangeOfString:@"."];
+    if (r.location == 10) return [s substringFromIndex:11];   // Team ID = 10 karakter
+    return s;
 }
-
-static void kcSave(void) {
-    if (![gKC writeToFile:fakeKeychainPath() atomically:YES])
-        LCLog(@"WARN gagal save keychain");
+static BOOL itemSync(NSDictionary *d) {
+    id s = d[(__bridge id)kSecAttrSynchronizable];
+    return [s isKindOfClass:[NSNumber class]] ? [s boolValue] : NO;
 }
 
 static NSString *kcKey(NSDictionary *a) {
@@ -284,7 +362,27 @@ static NSString *kcKey(NSDictionary *a) {
                     (__bridge id)kSecAttrPath];
     NSMutableArray *parts = [NSMutableArray array];
     for (id k in ks) [parts addObject:[NSString stringWithFormat:@"%@", a[k] ?: @""]];
+    [parts addObject:normGroup(a[(__bridge id)kSecAttrAccessGroup])];
+    [parts addObject:itemSync(a) ? @"sync" : @"local"];
     return [parts componentsJoinedByString:@"|"];
+}
+
+static NSMutableDictionary *kcStore(void) {   // panggil di dalam @synchronized
+    if (!gKC) {
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:fakeKeychainPath()];
+        gKC = [NSMutableDictionary dictionary];
+        // Re-key: file lama memakai key tanpa group/sync.
+        [d enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+            if ([v isKindOfClass:[NSDictionary class]]) gKC[kcKey(v)] = v;
+        }];
+        LCLog(@"keychain loaded, %lu item", (unsigned long)gKC.count);
+    }
+    return gKC;
+}
+
+static void kcSave(void) {
+    if (![gKC writeToFile:fakeKeychainPath() atomically:YES])
+        LCLog(@"WARN gagal save keychain");
 }
 
 // Buang kunci query-only dan nilai yang bukan tipe plist (SecAccessControlRef, dll)
@@ -306,7 +404,20 @@ static NSMutableDictionary *sanitize(NSDictionary *src) {
 static BOOL kcMatches(NSDictionary *item, NSDictionary *q) {
     NSData *pref = q[(__bridge id)kSecValuePersistentRef];
     if (pref && ![pref isEqual:[kcKey(item) dataUsingEncoding:NSUTF8StringEncoding]]) return NO;
-    // AccessGroup sengaja tidak dibandingkan (fake keychain tidak punya group nyata)
+
+    // Access group: kalau query menyebut group, item harus di group yang sama.
+    id qg = q[(__bridge id)kSecAttrAccessGroup];
+    if ([qg isKindOfClass:[NSString class]] && [qg length]) {
+        if (![normGroup(qg) isEqualToString:normGroup(item[(__bridge id)kSecAttrAccessGroup])]) return NO;
+    }
+    // Synchronizable: tanpa atribut ini, keychain asli hanya mengembalikan item non-sync.
+    id qs = q[(__bridge id)kSecAttrSynchronizable];
+    if (!qs) {
+        if (itemSync(item)) return NO;
+    } else if ([qs isKindOfClass:[NSNumber class]]) {
+        if ([qs boolValue] != itemSync(item)) return NO;
+    }   // selain itu (kSecAttrSynchronizableAny) = cocokkan semua
+
     NSArray *ks = @[(__bridge id)kSecClass, (__bridge id)kSecAttrService,
                     (__bridge id)kSecAttrAccount, (__bridge id)kSecAttrLabel,
                     (__bridge id)kSecAttrDescription, (__bridge id)kSecAttrComment,
@@ -339,6 +450,13 @@ static id kcFormat(NSDictionary *item, NSDictionary *q) {
         return m;
     }
     return [kcKey(item) dataUsingEncoding:NSUTF8StringEncoding];
+}
+
+static NSString *qdesc(NSDictionary *q) {
+    return [NSString stringWithFormat:@"grp=%@ svc=%@ acc=%@",
+            q[(__bridge id)kSecAttrAccessGroup] ?: @"-",
+            q[(__bridge id)kSecAttrService] ?: @"-",
+            q[(__bridge id)kSecAttrAccount] ?: @"-"];
 }
 
 static OSStatus my_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
@@ -379,8 +497,7 @@ static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
         NSMutableArray *hits = [NSMutableArray array];
         for (NSString *k in kcStore()) if (kcMatches(gKC[k], q)) [hits addObject:gKC[k]];
         if (!hits.count) {
-            LCLog(@"Copy NOT FOUND svc=%@ acc=%@",
-                  q[(__bridge id)kSecAttrService] ?: @"-", q[(__bridge id)kSecAttrAccount] ?: @"-");
+            LCLog(@"Copy NOT FOUND %@", qdesc(q));
             return errSecItemNotFound;
         }
         BOOL all = [q[(__bridge id)kSecMatchLimit] isEqual:(__bridge id)kSecMatchLimitAll];
@@ -392,7 +509,7 @@ static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
             id f = kcFormat(hits[0], q);
             if (result) *result = f ? CFRetain((__bridge CFTypeRef)f) : NULL;
         }
-        LCLog(@"Copy OK count=%lu", (unsigned long)hits.count);
+        LCLog(@"Copy OK count=%lu %@", (unsigned long)hits.count, qdesc(q));
         return errSecSuccess;
     }
 }
@@ -419,7 +536,7 @@ static OSStatus my_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attrsToU
             kc[newK] = item;
         }
         kcSave();
-        LCLog(@"Update OK count=%lu", (unsigned long)keys.count);
+        LCLog(@"Update OK count=%lu %@", (unsigned long)keys.count, qdesc(q));
     }
     return errSecSuccess;
 }
@@ -432,10 +549,13 @@ static OSStatus my_SecItemDelete(CFDictionaryRef query) {
         NSMutableDictionary *kc = kcStore();
         NSMutableArray *keys = [NSMutableArray array];
         for (NSString *k in kc) if (kcMatches(kc[k], q)) [keys addObject:k];
-        if (!keys.count) return errSecItemNotFound;
+        if (!keys.count) {
+            LCLog(@"Delete NOT FOUND %@", qdesc(q));
+            return errSecItemNotFound;
+        }
         [kc removeObjectsForKeys:keys];
         kcSave();
-        LCLog(@"Delete OK count=%lu", (unsigned long)keys.count);
+        LCLog(@"Delete OK count=%lu %@", (unsigned long)keys.count, qdesc(q));
     }
     return errSecSuccess;
 }
@@ -452,7 +572,7 @@ __attribute__((constructor))
 static void lc_init(void) {
     gLock = [NSObject new];
     openLogFile();                       // paling awal: kalau file ini muncul, dylib ter-load
-    LCLog(@"=== init v5 container=%@ home=%@", getContainerID(), NSHomeDirectory());
+    LCLog(@"=== init v6 container=%@ home=%@", getContainerID(), NSHomeDirectory());
 
 #if LC_CRASH_LOG
     NSSetUncaughtExceptionHandler(&crashException);
@@ -461,6 +581,7 @@ static void lc_init(void) {
 #endif
 
 #if LC_ENABLE_SWIZZLE
+    (void)fakeIDFV();                    // buat/baca IDFV sekarang, sebelum ada thread lain
     swizzleMethod([UIDevice class], @selector(identifierForVendor), @selector(lc_identifierForVendor));
 #if LC_BLOCK_PASTEBOARD
     swizzleMethod([UIPasteboard class], @selector(string), @selector(lc_string));
