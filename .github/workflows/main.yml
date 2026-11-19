@@ -1,0 +1,64 @@
+name: Build LCIsolator-Gopay
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Checkout fishhook
+        uses: actions/checkout@v4
+        with:
+          repository: facebook/fishhook
+          path: fishhook-src
+          fetch-depth: 1
+
+      - name: Compile LCIsolator-gopay.dylib
+        run: |
+          set -euo pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          clang -arch arm64 \
+            -dynamiclib \
+            -fobjc-arc \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=15.0 \
+            -Wno-deprecated-declarations \
+            -I fishhook-src \
+            -framework Foundation \
+            -framework UIKit \
+            -framework WebKit \
+            -framework Security \
+            -lobjc \
+            -Wl,-install_name,@rpath/LCIsolator-gopay.dylib \
+            -o LCIsolator-gopay.dylib \
+            LCIsolator.m \
+            fishhook-src/fishhook.c
+          # ad-hoc sign; LiveContainer akan sign ulang
+          codesign -f -s - LCIsolator-gopay.dylib
+
+      - name: Verify dylib
+        run: |
+          set -euo pipefail
+          file LCIsolator-gopay.dylib
+          echo "=== Dependencies (tidak boleh ada libdobby / path aneh) ==="
+          otool -L LCIsolator-gopay.dylib
+          echo "=== Constructor harus ada ==="
+          # linker baru memakai __init_offsets, linker lama memakai __mod_init_func
+          otool -l LCIsolator-gopay.dylib | grep -E "mod_init_func|init_offsets" \
+            || (echo "ERROR: tidak ada constructor"; exit 1)
+          echo "=== Min OS ==="
+          otool -l LCIsolator-gopay.dylib | grep -A4 LC_BUILD_VERSION || true
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LCIsolator-gopay-dylib
+          path: LCIsolator-gopay.dylib
+          if-no-files-found: error
