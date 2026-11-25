@@ -1,20 +1,18 @@
-// LCIsolator v6 - tanpa Dobby/JIT (pakai fishhook), dengan log ke file.
+// LCIsolator v7 - tanpa Dobby/JIT (pakai fishhook), dengan log ke file.
 // Log: <container>/Documents/lcisolator.log
 //
-// Perubahan v6 (perbaikan logout GoPay, hasil bedah IPA GoPay 2.23.3):
-//  1. Fake keychain sekarang MEMBEDAKAN kSecAttrAccessGroup & kSecAttrSynchronizable.
-//     GoPay memakai 3 access group (gojekSharedKeychain, gojekSharedKeychainBiometric,
-//     gotoSharedKeychain) dan GotoLoginSSO punya delete(accessGroup:)/deleteAll(accessGroup:).
-//     Dulu group diabaikan -> hapus satu group = hapus token di SEMUA group,
-//     dan item dengan service/account sama di group beda dianggap duplikat.
-//  2. IDFV dibuat sekali (thread-safe, dispatch_once) lalu disimpan ke FILE, bukan
-//     NSUserDefaults. login_sdk memakai IDFV sebagai clientDeviceId yang ikut disimpan
-//     bersama token; kalau IDFV berubah antar launch/thread, token dianggap tidak valid.
-//  3. Container ID dikunci ke file (Library/lc_container_id) supaya nama file keychain,
-//     IDFV, dan WebView store tidak berubah antar launch. File keychain versi lama
-//     (lc_fake_keychain_*.plist) dimigrasikan otomatis.
-//  4. Log Delete sekarang mencatat group/service/account, supaya kelihatan siapa
-//     yang menghapus sesi.
+// Perubahan v7 (satu-satunya perubahan dari v6 yang kamu tempel):
+//  - Tambah swizzle -[WKWebView initWithFrame:configuration:]. WebView yang dibuat tanpa
+//    mengisi websiteDataStore memakai store default internal WebKit (dipanggil dari C++,
+//    TIDAK lewat +defaultDataStore), jadi swizzle +defaultDataStore saja tidak menangkapnya.
+//    Sekarang konfigurasi yang memakai store persisten dipaksa ke store milik container.
+//    Mode incognito (non-persisten) tidak disentuh.
+//
+// Perubahan v6 (dari versi sebelumnya):
+//  1. Fake keychain MEMBEDAKAN kSecAttrAccessGroup & kSecAttrSynchronizable.
+//  2. IDFV dibuat sekali (thread-safe, dispatch_once) lalu disimpan ke FILE.
+//  3. Container ID dikunci ke file (Library/lc_container_id); file keychain lama dimigrasikan.
+//  4. Log Delete mencatat group/service/account.
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -215,8 +213,8 @@ static void swizzleClassMethod(Class cls, SEL o, SEL n) {
 #endif
 
 // Data store WebView per container (butuh iOS 17+). Yang diganti adalah
-// +[WKWebsiteDataStore defaultDataStore], jadi WebView DAN cookie manager
-// (httpCookieStore) sama-sama memakai store milik container ini.
+// +[WKWebsiteDataStore defaultDataStore], jadi cookie manager (httpCookieStore)
+// dan pemanggil eksplisit memakai store milik container ini.
 // Mode incognito (nonPersistentDataStore) sengaja tidak disentuh.
 static WKWebsiteDataStore *isolatedStore(void) {
     static WKWebsiteDataStore *s; static dispatch_once_t t;
@@ -236,6 +234,24 @@ static WKWebsiteDataStore *isolatedStore(void) {
 + (WKWebsiteDataStore *)lc_defaultDataStore {
     WKWebsiteDataStore *iso = isolatedStore();
     return iso ?: [self lc_defaultDataStore];   // setelah swizzle: memanggil yang asli
+}
+@end
+
+// v7: WebView yang dibuat tanpa mengisi websiteDataStore memakai store default internal
+// WebKit (tidak lewat +defaultDataStore). Paksa konfigurasinya ke store container
+// sebelum WebView dibuat, supaya WebView dan cookie manager memakai store yang SAMA.
+@implementation WKWebView (LCIsolation)
+- (instancetype)lc_initWithFrame:(CGRect)frame configuration:(WKWebViewConfiguration *)configuration {
+    WKWebsiteDataStore *iso = isolatedStore();
+    if (iso && configuration) {
+        WKWebsiteDataStore *cur = configuration.websiteDataStore;
+        if (cur != iso && cur.isPersistent) {
+            configuration.websiteDataStore = iso;
+            static int n = 0;
+            if (n++ < 8) LCLog(@"WKWebView init: data store dipaksa ke store container (#%d)", n);
+        }
+    }
+    return [self lc_initWithFrame:frame configuration:configuration];
 }
 @end
 
@@ -340,7 +356,7 @@ static BOOL isPasswordClass(NSDictionary *d) {
            [c isEqual:(__bridge id)kSecClassInternetPassword];
 }
 
-// ---- Access group & synchronizable (inti perbaikan v6) ----
+// ---- Access group & synchronizable ----
 // Team ID di-buang (GF3689X945.gojekSharedKeychain -> gojekSharedKeychain) karena
 // prefix itu berubah setelah di-resign. Tanpa group = group default (entitlement pertama).
 static NSString *normGroup(id g) {
@@ -572,7 +588,7 @@ __attribute__((constructor))
 static void lc_init(void) {
     gLock = [NSObject new];
     openLogFile();                       // paling awal: kalau file ini muncul, dylib ter-load
-    LCLog(@"=== init v6 container=%@ home=%@", getContainerID(), NSHomeDirectory());
+    LCLog(@"=== init v7 container=%@ home=%@", getContainerID(), NSHomeDirectory());
 
 #if LC_CRASH_LOG
     NSSetUncaughtExceptionHandler(&crashException);
@@ -589,6 +605,7 @@ static void lc_init(void) {
 #endif
     if ([NSThread isMainThread]) (void)isolatedStore();   // buat store sebelum swizzle
     swizzleClassMethod([WKWebsiteDataStore class], @selector(defaultDataStore), @selector(lc_defaultDataStore));
+    swizzleMethod([WKWebView class], @selector(initWithFrame:configuration:), @selector(lc_initWithFrame:configuration:));
     swizzleMethod([NSFileManager class], @selector(containerURLForSecurityApplicationGroupIdentifier:),
                   @selector(lc_containerURLForSecurityApplicationGroupIdentifier:));
 #endif
