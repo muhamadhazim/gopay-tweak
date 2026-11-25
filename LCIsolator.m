@@ -1,31 +1,10 @@
-// LCIsolator v8 - tanpa Dobby/JIT (pakai fishhook), dengan log ke file.
-// Log: <container>/Documents/lcisolator.log
-//
-// Perubahan v8: HANYA tambahan log diagnostik + saklar A/B (perilaku isolasi sama dengan v7).
-//  - LC_FORCE_WEBVIEW_STORE=0 mematikan pemaksaan store di WKWebView init (untuk membandingkan
-//    apakah v7 memperburuk). Log menampilkan kelas WebView dan status store tiap pembuatan.
-//  - LC_TRACE_WEB=1 mencatat (tanpa nilai rahasia): host+path loadRequest, NAMA+domain cookie
-//    yang ditulis, nama JS message handler, host openURL, SFSafariViewController/ASWebAuth.
-//
-// Perubahan v7:
-//  - Tambah swizzle -[WKWebView initWithFrame:configuration:]. WebView yang dibuat tanpa
-//    mengisi websiteDataStore memakai store default internal WebKit (dipanggil dari C++,
-//    TIDAK lewat +defaultDataStore), jadi swizzle +defaultDataStore saja tidak menangkapnya.
-//    Sekarang konfigurasi yang memakai store persisten dipaksa ke store milik container.
-//    Mode incognito (non-persisten) tidak disentuh.
-//
-// Perubahan v6 (dari versi sebelumnya):
-//  1. Fake keychain MEMBEDAKAN kSecAttrAccessGroup & kSecAttrSynchronizable.
-//  2. IDFV dibuat sekali (thread-safe, dispatch_once) lalu disimpan ke FILE.
-//  3. Container ID dikunci ke file (Library/lc_container_id); file keychain lama dimigrasikan.
-//  4. Log Delete mencatat group/service/account.
-
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
 #import <Security/Security.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <signal.h>
 #import <execinfo.h>
 #import <fcntl.h>
@@ -39,6 +18,7 @@
 #define LC_CRASH_LOG        1
 #define LC_FORCE_WEBVIEW_STORE 1   // 0 = jangan paksa store di WKWebView init (tes A/B)
 #define LC_TRACE_WEB        1      // log diagnostik jalur WebView/browser (tanpa nilai cookie/token)
+#define LC_TRACE_AUTH       1      // log diagnostik LAContext (Face ID/PIN) dan izin Kontak/Lokasi
 
 // Access group default = group PERTAMA di entitlement GoPay (tanpa prefix Team ID).
 #define LC_DEFAULT_KC_GROUP @"gojekSharedKeychain"
@@ -548,11 +528,24 @@ static NSString *qdesc(NSDictionary *q) {
             q[(__bridge id)kSecAttrAccount] ?: @"-"];
 }
 
+static void logCFError(NSString *what, CFErrorRef e) {
+    if (!e) { LCLog(@"[key] %@ GAGAL (tanpa detail error)", what); return; }
+    LCLog(@"[key] %@ GAGAL code=%ld domain=%@", what, (long)CFErrorGetCode(e), (__bridge NSString *)CFErrorGetDomain(e));
+}
+static NSString *tagStr(id t) {
+    if ([t isKindOfClass:[NSData class]]) {
+        NSString *s = [[NSString alloc] initWithData:t encoding:NSUTF8StringEncoding];
+        return s ?: [NSString stringWithFormat:@"<%lu byte>", (unsigned long)[t length]];
+    }
+    return t ? [NSString stringWithFormat:@"%@", t] : @"-";
+}
+
 static OSStatus my_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
     NSDictionary *a = (__bridge NSDictionary *)attributes;
     if (a && isKeyClass(a)) {
         OSStatus st = orig_SecItemAdd((__bridge CFDictionaryRef)scopeKeyDict(a), result);
         if (st == errSecSuccess) unscopeResult(result);
+        LCLog(@"[key] SecItemAdd status=%d tag=%@", (int)st, tagStr(a[(__bridge id)kSecAttrApplicationTag]));
         return st;
     }
     if (!a || !isPasswordClass(a)) return orig_SecItemAdd(attributes, result);
@@ -579,6 +572,7 @@ static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
     if (q && isKeyClass(q)) {
         OSStatus st = orig_SecItemCopyMatching((__bridge CFDictionaryRef)scopeKeyDict(q), result);
         if (st == errSecSuccess) unscopeResult(result);
+        LCLog(@"[key] SecItemCopyMatching status=%d tag=%@", (int)st, tagStr(q[(__bridge id)kSecAttrApplicationTag]));
         return st;
     }
     if (!q || !isPasswordClass(q)) return orig_SecItemCopyMatching(query, result);
@@ -606,9 +600,12 @@ static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
 static OSStatus my_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attrsToUpdate) {
     NSDictionary *q = (__bridge NSDictionary *)query;
     NSDictionary *upd = (__bridge NSDictionary *)attrsToUpdate;
-    if (q && isKeyClass(q))
-        return orig_SecItemUpdate((__bridge CFDictionaryRef)scopeKeyDict(q),
-                                  attrsToUpdate ? (__bridge CFDictionaryRef)scopeKeyDict(upd) : NULL);
+    if (q && isKeyClass(q)) {
+        OSStatus st = orig_SecItemUpdate((__bridge CFDictionaryRef)scopeKeyDict(q),
+                                         attrsToUpdate ? (__bridge CFDictionaryRef)scopeKeyDict(upd) : NULL);
+        LCLog(@"[key] SecItemUpdate status=%d tag=%@", (int)st, tagStr(q[(__bridge id)kSecAttrApplicationTag]));
+        return st;
+    }
     if (!q || !isPasswordClass(q)) return orig_SecItemUpdate(query, attrsToUpdate);
     if (!upd) return errSecParam;
     @synchronized (gLock) {
@@ -632,7 +629,11 @@ static OSStatus my_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attrsToU
 
 static OSStatus my_SecItemDelete(CFDictionaryRef query) {
     NSDictionary *q = (__bridge NSDictionary *)query;
-    if (q && isKeyClass(q)) return orig_SecItemDelete((__bridge CFDictionaryRef)scopeKeyDict(q));
+    if (q && isKeyClass(q)) {
+        OSStatus st = orig_SecItemDelete((__bridge CFDictionaryRef)scopeKeyDict(q));
+        LCLog(@"[key] SecItemDelete status=%d tag=%@", (int)st, tagStr(q[(__bridge id)kSecAttrApplicationTag]));
+        return st;
+    }
     if (!q || !isPasswordClass(q)) return orig_SecItemDelete(query);
     @synchronized (gLock) {
         NSMutableDictionary *kc = kcStore();
@@ -652,8 +653,76 @@ static OSStatus my_SecItemDelete(CFDictionaryRef query) {
 static SecKeyRef my_SecKeyCreateRandomKey(CFDictionaryRef params, CFErrorRef *error) {
     NSDictionary *p = (__bridge NSDictionary *)params;
     if (!p) return orig_SecKeyCreateRandomKey(params, error);
-    return orig_SecKeyCreateRandomKey((__bridge CFDictionaryRef)scopeKeyParams(p), error);
+    BOOL se = [p[(__bridge id)kSecAttrTokenID] isEqual:(__bridge id)kSecAttrTokenIDSecureEnclave];
+    CFErrorRef local = NULL;
+    SecKeyRef k = orig_SecKeyCreateRandomKey((__bridge CFDictionaryRef)scopeKeyParams(p), error ? error : &local);
+    CFErrorRef e = error ? *error : local;
+    NSString *tag = [NSString stringWithFormat:@"SecKeyCreateRandomKey(secureEnclave=%@)", se ? @"YA" : @"tidak"];
+    if (k) LCLog(@"[key] %@ OK", tag); else logCFError(tag, e);
+    if (local) CFRelease(local);
+    return k;
 }
+
+#pragma mark - Diagnostik key/biometrik (v9, hanya log)
+
+static CFDataRef (*orig_SecKeyCreateEncryptedData)(SecKeyRef, SecKeyAlgorithm, CFDataRef, CFErrorRef *);
+static CFDataRef (*orig_SecKeyCreateDecryptedData)(SecKeyRef, SecKeyAlgorithm, CFDataRef, CFErrorRef *);
+static CFDataRef (*orig_SecKeyCreateSignature)(SecKeyRef, SecKeyAlgorithm, CFDataRef, CFErrorRef *);
+
+#define LC_KEYOP(NAME, ORIG) \
+static CFDataRef NAME(SecKeyRef key, SecKeyAlgorithm alg, CFDataRef data, CFErrorRef *error) { \
+    CFErrorRef local = NULL; \
+    CFDataRef r = ORIG(key, alg, data, error ? error : &local); \
+    CFErrorRef e = error ? *error : local; \
+    if (r) LCLog(@"[key] " #NAME " OK"); else logCFError(@"" #NAME, e); \
+    if (local) CFRelease(local); \
+    return r; \
+}
+LC_KEYOP(my_SecKeyCreateEncryptedData, orig_SecKeyCreateEncryptedData)
+LC_KEYOP(my_SecKeyCreateDecryptedData, orig_SecKeyCreateDecryptedData)
+LC_KEYOP(my_SecKeyCreateSignature, orig_SecKeyCreateSignature)
+
+#if LC_TRACE_AUTH
+static BOOL (*orig_laCan)(id, SEL, NSInteger, NSError **);
+static BOOL my_laCan(id self, SEL _cmd, NSInteger policy, NSError **err) {
+    BOOL r; long code = 0;
+    if (err) { r = orig_laCan(self, _cmd, policy, err); code = (long)(*err).code; }
+    else { NSError *local = nil; r = orig_laCan(self, _cmd, policy, &local); code = (long)local.code; }
+    LCLog(@"LAContext canEvaluatePolicy policy=%ld -> %@ errcode=%ld", (long)policy, r ? @"YA" : @"TIDAK", code);
+    return r;
+}
+static void (*orig_laEval)(id, SEL, NSInteger, NSString *, void (^)(BOOL, NSError *));
+static void my_laEval(id self, SEL _cmd, NSInteger policy, NSString *reason, void (^reply)(BOOL, NSError *)) {
+    LCLog(@"LAContext evaluatePolicy policy=%ld dimulai", (long)policy);
+    orig_laEval(self, _cmd, policy, reason, ^(BOOL ok, NSError *e) {
+        LCLog(@"LAContext evaluatePolicy -> %@ errcode=%ld", ok ? @"BERHASIL" : @"GAGAL", (long)e.code);
+        if (reply) reply(ok, e);
+    });
+}
+static void installAuthTrace(void) {
+    [[NSBundle bundleWithPath:@"/System/Library/Frameworks/LocalAuthentication.framework"] load];
+    Class la = NSClassFromString(@"LAContext");
+    Method m1 = la ? class_getInstanceMethod(la, NSSelectorFromString(@"canEvaluatePolicy:error:")) : NULL;
+    if (m1) { orig_laCan = (BOOL (*)(id, SEL, NSInteger, NSError **))method_setImplementation(m1, (IMP)my_laCan); LCLog(@"trace OK LAContext.canEvaluatePolicy"); }
+    Method m2 = la ? class_getInstanceMethod(la, NSSelectorFromString(@"evaluatePolicy:localizedReason:reply:")) : NULL;
+    if (m2) { orig_laEval = (void (*)(id, SEL, NSInteger, NSString *, void (^)(BOOL, NSError *)))method_setImplementation(m2, (IMP)my_laEval); LCLog(@"trace OK LAContext.evaluatePolicy"); }
+}
+// Izin dipegang LiveContainer (bukan GoPay). Hanya status, tidak meminta izin.
+static void logPermissionStatus(void) {
+    [[NSBundle bundleWithPath:@"/System/Library/Frameworks/Contacts.framework"] load];
+    [[NSBundle bundleWithPath:@"/System/Library/Frameworks/CoreLocation.framework"] load];
+    Class cn = NSClassFromString(@"CNContactStore");
+    if (cn) {
+        NSInteger st = ((NSInteger (*)(Class, SEL, NSInteger))objc_msgSend)(cn, NSSelectorFromString(@"authorizationStatusForEntityType:"), 0);
+        LCLog(@"izin Kontak status=%ld (0=belum ditanya, 1=dibatasi, 2=DITOLAK, 3=diizinkan, 4=terbatas)", (long)st);
+    }
+    Class cl = NSClassFromString(@"CLLocationManager");
+    if (cl) {
+        int st = ((int (*)(Class, SEL))objc_msgSend)(cl, NSSelectorFromString(@"authorizationStatus"));
+        LCLog(@"izin Lokasi status=%d (0=belum ditanya, 1=dibatasi, 2=DITOLAK, 3=selalu, 4=saat dipakai)", st);
+    }
+}
+#endif
 
 #pragma mark - Init
 
@@ -661,7 +730,7 @@ __attribute__((constructor))
 static void lc_init(void) {
     gLock = [NSObject new];
     openLogFile();                       // paling awal: kalau file ini muncul, dylib ter-load
-    LCLog(@"=== init v8 container=%@ home=%@", getContainerID(), NSHomeDirectory());
+    LCLog(@"=== init v9 container=%@ home=%@", getContainerID(), NSHomeDirectory());
 
 #if LC_CRASH_LOG
     NSSetUncaughtExceptionHandler(&crashException);
@@ -690,6 +759,10 @@ static void lc_init(void) {
     swizzleMethod([UIApplication class], @selector(openURL:options:completionHandler:), @selector(lc_openURL:options:completionHandler:));
     installBrowserTrace();
 #endif
+#if LC_TRACE_AUTH
+    installAuthTrace();
+    logPermissionStatus();
+#endif
 
 #if LC_ENABLE_KEYCHAIN
     struct rebinding r[] = {
@@ -698,8 +771,11 @@ static void lc_init(void) {
         {"SecItemUpdate",       (void *)my_SecItemUpdate,       (void **)&orig_SecItemUpdate},
         {"SecItemDelete",       (void *)my_SecItemDelete,       (void **)&orig_SecItemDelete},
         {"SecKeyCreateRandomKey", (void *)my_SecKeyCreateRandomKey, (void **)&orig_SecKeyCreateRandomKey},
+        {"SecKeyCreateEncryptedData", (void *)my_SecKeyCreateEncryptedData, (void **)&orig_SecKeyCreateEncryptedData},
+        {"SecKeyCreateDecryptedData", (void *)my_SecKeyCreateDecryptedData, (void **)&orig_SecKeyCreateDecryptedData},
+        {"SecKeyCreateSignature", (void *)my_SecKeyCreateSignature, (void **)&orig_SecKeyCreateSignature},
     };
-    int rc = rebind_symbols(r, 5);
+    int rc = rebind_symbols(r, 8);
     LCLog(@"rebind_symbols rc=%d", rc);
 #endif
 
