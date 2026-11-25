@@ -1,7 +1,13 @@
-// LCIsolator v7 - tanpa Dobby/JIT (pakai fishhook), dengan log ke file.
+// LCIsolator v8 - tanpa Dobby/JIT (pakai fishhook), dengan log ke file.
 // Log: <container>/Documents/lcisolator.log
 //
-// Perubahan v7 (satu-satunya perubahan dari v6 yang kamu tempel):
+// Perubahan v8: HANYA tambahan log diagnostik + saklar A/B (perilaku isolasi sama dengan v7).
+//  - LC_FORCE_WEBVIEW_STORE=0 mematikan pemaksaan store di WKWebView init (untuk membandingkan
+//    apakah v7 memperburuk). Log menampilkan kelas WebView dan status store tiap pembuatan.
+//  - LC_TRACE_WEB=1 mencatat (tanpa nilai rahasia): host+path loadRequest, NAMA+domain cookie
+//    yang ditulis, nama JS message handler, host openURL, SFSafariViewController/ASWebAuth.
+//
+// Perubahan v7:
 //  - Tambah swizzle -[WKWebView initWithFrame:configuration:]. WebView yang dibuat tanpa
 //    mengisi websiteDataStore memakai store default internal WebKit (dipanggil dari C++,
 //    TIDAK lewat +defaultDataStore), jadi swizzle +defaultDataStore saja tidak menangkapnya.
@@ -31,6 +37,8 @@
 #define LC_ENABLE_KEYCHAIN  1
 #define LC_BLOCK_PASTEBOARD 1   // 0 kalau paste di app jadi tidak bisa
 #define LC_CRASH_LOG        1
+#define LC_FORCE_WEBVIEW_STORE 1   // 0 = jangan paksa store di WKWebView init (tes A/B)
+#define LC_TRACE_WEB        1      // log diagnostik jalur WebView/browser (tanpa nilai cookie/token)
 
 // Access group default = group PERTAMA di entitlement GoPay (tanpa prefix Team ID).
 #define LC_DEFAULT_KC_GROUP @"gojekSharedKeychain"
@@ -243,17 +251,82 @@ static WKWebsiteDataStore *isolatedStore(void) {
 @implementation WKWebView (LCIsolation)
 - (instancetype)lc_initWithFrame:(CGRect)frame configuration:(WKWebViewConfiguration *)configuration {
     WKWebsiteDataStore *iso = isolatedStore();
-    if (iso && configuration) {
+    NSString *state = @"tanpa-configuration";
+    if (configuration) {
         WKWebsiteDataStore *cur = configuration.websiteDataStore;
-        if (cur != iso && cur.isPersistent) {
-            configuration.websiteDataStore = iso;
-            static int n = 0;
-            if (n++ < 8) LCLog(@"WKWebView init: data store dipaksa ke store container (#%d)", n);
+        if (!cur.isPersistent) state = @"non-persisten (dibiarkan)";
+        else if (iso && cur == iso) state = @"sudah store container";
+        else {
+#if LC_FORCE_WEBVIEW_STORE
+            if (iso) { configuration.websiteDataStore = iso; state = @"DIPAKSA ke store container"; }
+            else state = @"persisten, tidak bisa dipaksa (iOS <17)";
+#else
+            state = @"persisten, store bersama (LC_FORCE_WEBVIEW_STORE=0)";
+#endif
         }
     }
+    static int n = 0;
+    if (n++ < 40) LCLog(@"WKWebView init class=%@ store=%@", NSStringFromClass(self.class), state);
     return [self lc_initWithFrame:frame configuration:configuration];
 }
 @end
+
+#if LC_TRACE_WEB
+// ---- Diagnostik: hanya host/path/nama, tidak pernah nilai cookie atau token ----
+@implementation WKWebView (LCTrace)
+- (WKNavigation *)lc_loadRequest:(NSURLRequest *)req {
+    LCLog(@"WKWebView(%@) loadRequest %@://%@%@", NSStringFromClass(self.class),
+          req.URL.scheme ?: @"-", req.URL.host ?: @"-", req.URL.path ?: @"");
+    return [self lc_loadRequest:req];
+}
+@end
+
+@implementation WKHTTPCookieStore (LCTrace)
+- (void)lc_setCookie:(NSHTTPCookie *)cookie completionHandler:(void (^)(void))handler {
+    LCLog(@"WKHTTPCookieStore setCookie name=%@ domain=%@", cookie.name, cookie.domain);
+    [self lc_setCookie:cookie completionHandler:handler];
+}
+@end
+
+@implementation WKUserContentController (LCTrace)
+- (void)lc_addScriptMessageHandler:(id<WKScriptMessageHandler>)handler name:(NSString *)name {
+    LCLog(@"WK JS message handler: %@", name);
+    [self lc_addScriptMessageHandler:handler name:name];
+}
+@end
+
+@implementation UIApplication (LCTrace)
+- (void)lc_openURL:(NSURL *)url options:(NSDictionary *)options completionHandler:(void (^)(BOOL))handler {
+    LCLog(@"UIApplication openURL %@://%@", url.scheme ?: @"-", url.host ?: @"-");
+    [self lc_openURL:url options:options completionHandler:handler];
+}
+@end
+
+// SFSafariViewController / ASWebAuthenticationSession dicari lewat runtime
+// (tanpa link framework tambahan, jadi build.yml tidak perlu diubah).
+static id (*orig_sfInit)(id, SEL, NSURL *, id);
+static id my_sfInit(id self, SEL _cmd, NSURL *url, id cfg) {
+    LCLog(@"SFSafariViewController %@://%@", url.scheme ?: @"-", url.host ?: @"-");
+    return orig_sfInit(self, _cmd, url, cfg);
+}
+static id (*orig_asInit)(id, SEL, NSURL *, NSString *, id);
+static id my_asInit(id self, SEL _cmd, NSURL *url, NSString *scheme, id handler) {
+    LCLog(@"ASWebAuthenticationSession %@://%@ callback=%@", url.scheme ?: @"-", url.host ?: @"-", scheme ?: @"-");
+    return orig_asInit(self, _cmd, url, scheme, handler);
+}
+static void installBrowserTrace(void) {
+    [[NSBundle bundleWithPath:@"/System/Library/Frameworks/SafariServices.framework"] load];
+    [[NSBundle bundleWithPath:@"/System/Library/Frameworks/AuthenticationServices.framework"] load];
+    Class sf = NSClassFromString(@"SFSafariViewController");
+    Method m1 = sf ? class_getInstanceMethod(sf, @selector(initWithURL:configuration:)) : NULL;
+    if (m1) { orig_sfInit = (void *)method_setImplementation(m1, (IMP)my_sfInit); LCLog(@"trace OK SFSafariViewController"); }
+    else LCLog(@"trace SKIP SFSafariViewController");
+    Class as = NSClassFromString(@"ASWebAuthenticationSession");
+    Method m2 = as ? class_getInstanceMethod(as, @selector(initWithURL:callbackURLScheme:completionHandler:)) : NULL;
+    if (m2) { orig_asInit = (void *)method_setImplementation(m2, (IMP)my_asInit); LCLog(@"trace OK ASWebAuthenticationSession"); }
+    else LCLog(@"trace SKIP ASWebAuthenticationSession");
+}
+#endif
 
 // App group (group.com.go-jek.gopay.files) diarahkan ke folder
 // milik container ini sendiri, supaya tidak ada folder yang dipakai bersama.
@@ -588,7 +661,7 @@ __attribute__((constructor))
 static void lc_init(void) {
     gLock = [NSObject new];
     openLogFile();                       // paling awal: kalau file ini muncul, dylib ter-load
-    LCLog(@"=== init v7 container=%@ home=%@", getContainerID(), NSHomeDirectory());
+    LCLog(@"=== init v8 container=%@ home=%@", getContainerID(), NSHomeDirectory());
 
 #if LC_CRASH_LOG
     NSSetUncaughtExceptionHandler(&crashException);
@@ -608,6 +681,14 @@ static void lc_init(void) {
     swizzleMethod([WKWebView class], @selector(initWithFrame:configuration:), @selector(lc_initWithFrame:configuration:));
     swizzleMethod([NSFileManager class], @selector(containerURLForSecurityApplicationGroupIdentifier:),
                   @selector(lc_containerURLForSecurityApplicationGroupIdentifier:));
+#endif
+
+#if LC_TRACE_WEB
+    swizzleMethod([WKWebView class], @selector(loadRequest:), @selector(lc_loadRequest:));
+    swizzleMethod([WKHTTPCookieStore class], @selector(setCookie:completionHandler:), @selector(lc_setCookie:completionHandler:));
+    swizzleMethod([WKUserContentController class], @selector(addScriptMessageHandler:name:), @selector(lc_addScriptMessageHandler:name:));
+    swizzleMethod([UIApplication class], @selector(openURL:options:completionHandler:), @selector(lc_openURL:options:completionHandler:));
+    installBrowserTrace();
 #endif
 
 #if LC_ENABLE_KEYCHAIN
