@@ -3453,17 +3453,10 @@ static void lc_init(void) {
 
     // Hook framework opsional & pre-warm WebKit seawal mungkin di main thread.
     dispatch_async(dispatch_get_main_queue(), ^{
+        refreshLogFile(NO);
         installDeferredHooks();
     });
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-    [nc addObserverForName:UIApplicationWillFinishLaunchingNotification
-                    object:nil
-                     queue:[NSOperationQueue mainQueue]
-                usingBlock:^(NSNotification *n) {
-        (void)n;
-        refreshLogFile(NO);
-        installDeferredHooks();
-    }];
     [nc addObserverForName:UIApplicationDidFinishLaunchingNotification
                     object:nil
                      queue:[NSOperationQueue mainQueue]
