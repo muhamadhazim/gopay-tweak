@@ -6,51 +6,94 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <mach-o/dyld.h>
 #import <signal.h>
 #import <execinfo.h>
 #import <fcntl.h>
 #import <unistd.h>
+#import <string.h>
+#import <errno.h>
+#import <stdatomic.h>
 #import "fishhook.h"
 
 // ============================================================================
-// LCIsolator v10 — Deep Container Isolation untuk GoPay di LiveContainer
-// Saklar bisecting: matikan satu per satu (0) jika ingin uji A/B.
+// LCIsolator v11 — Deep Container Isolation untuk GoPay v2.23.1 di LiveContainer
+// Disusun dari audit REA + 99 biner Mach-O + Dart AOT + 8 JS bridge + runtime log.
+// Saklar bisecting: bisa dioverride via -DLC_...=0/1/2/3 saat compile.
 // ============================================================================
+#ifndef LC_ENABLE_SWIZZLE
 #define LC_ENABLE_SWIZZLE           1
-#define LC_ENABLE_KEYCHAIN          1
-#define LC_ISOLATE_PREFS            1   // NSUserDefaults (6 method domain) + CFPreferences* (non-Apple)
-#define LC_ISOLATE_WEB_NET          1   // NSHTTPCookieStorage, NSURLCache, NSURLCredentialStorage, NSURLSessionConfiguration, WKWebViewConfiguration, WKProcessPool
-#define LC_FORCE_WEBVIEW_STORE      1   // Paksa WKWebsiteDataStore container di WKWebViewConfiguration & WKWebView
-#define LC_WEBVIEW_IOS16_NONPERSIST 0   // 1 = fallback nonPersistentDataStore di iOS <17 (cookie tetap via NSHTTPCookieStorage)
-#define LC_EPHEMERAL_WEBAUTH        1   // Paksa ASWebAuthenticationSession.prefersEphemeralWebBrowserSession = YES
-#define LC_PASTEBOARD_MODE          1   // 0=off, 1=isolasi in-container (copy-paste internal jalan), 2=blokir total
+#endif
+#ifndef LC_ENABLE_KEYCHAIN
+#define LC_ENABLE_KEYCHAIN          1   // Fake KC (UTF-8 canonical + migrasi v10) + 2-phase kSecClassKey + SecKeyGeneratePair
+#endif
+#ifndef LC_ISOLATE_PREFS
+#define LC_ISOLATE_PREFS            1   // NSUserDefaults (6 domain methods + canary check) + CFPreferences* (termasuk kCFPreferencesCurrentApplication)
+#endif
+#ifndef LC_ISOLATE_WEB_NET
+#define LC_ISOLATE_WEB_NET          1   // NSHTTPCookieStorage, NSURLCache, NSURLCredentialStorage, NSURLSession (shared/default/bg), WKWebsiteDataStore, WKWebViewConfiguration, WKContentRuleListStore
+#endif
+#ifndef LC_FORCE_WEBVIEW_STORE
+#define LC_FORCE_WEBVIEW_STORE      1   // Paksa WKWebsiteDataStore container di WKWebViewConfiguration & WKWebView (aman untuk popup 3DS/_relatedWebView)
+#endif
+#ifndef LC_WEBVIEW_IOS16_ISOLATE
+#define LC_WEBVIEW_IOS16_ISOLATE    1   // 1 = fallback nonPersistentDataStore + sync cookie ke isolatedCookieStorage di iOS 15-16 (otomatis tidak aktif di iOS 17+)
+#endif
+#ifndef LC_EPHEMERAL_WEBAUTH
+#define LC_EPHEMERAL_WEBAUTH        1   // Paksa ASWebAuthenticationSession.prefersEphemeralWebBrowserSession = YES (tahan overwrite AppAuth/flutter_inappwebview)
+#endif
+#ifndef LC_PASTEBOARD_MODE
+#define LC_PASTEBOARD_MODE          3   // 0=off, 1=full in-container sandbox, 2=blokir total, 3=Smart Payment (named+changeCount+background diisolasi, copy-paste VA/OTP aktif tetap jalan)
+#endif
+#ifndef LC_ISOLATE_NOTIFICATIONS
 #define LC_ISOLATE_NOTIFICATIONS    1   // Isolasi UNUserNotificationCenter per container
-#define LC_ISOLATE_DEVICE_IDS       1   // IDFV, IDFA (zero UUID), UIDevice.name, NSProcessInfo.hostName
+#endif
+#ifndef LC_ISOLATE_SYSTEM_UI
+#define LC_ISOLATE_SYSTEM_UI        1   // Isolasi UIApplication.shortcutItems & badge count per container
+#endif
+#ifndef LC_ISOLATE_DEVICE_IDS
+#define LC_ISOLATE_DEVICE_IDS       1   // IDFV, IDFA (zero UUID), UIDevice.name, NSProcessInfo.hostName, C gethostname()
+#endif
+#ifndef LC_CRASH_LOG
 #define LC_CRASH_LOG                1   // Chained sigaction + uncaught exception logger (tidak menimpa Crashlytics/Flutter)
-#define LC_TRACE_WEB                1   // Log diagnostik jalur WebView/browser (tanpa nilai cookie/token)
-#define LC_TRACE_AUTH               1   // Log diagnostik LAContext (Face ID/PIN) & status izin
+#endif
+#ifndef LC_TRACE_WEB
+#define LC_TRACE_WEB                1   // Log diagnostik WebView/browser/contentWorld/cookie-clear (tanpa nilai token/cookie)
+#endif
+#ifndef LC_TRACE_AUTH
+#define LC_TRACE_AUTH               1   // Log diagnostik LAContext (dengan throttle/dedup anti-spam) & status izin
+#endif
 
 // Access group default = group PERTAMA di entitlement GoPay (tanpa prefix Team ID).
+#ifndef LC_DEFAULT_KC_GROUP
 #define LC_DEFAULT_KC_GROUP @"gojekSharedKeychain"
+#endif
 
-#pragma mark - Logging (lazy & thread-safe, tidak mengunci NSHomeDirectory terlalu dini)
+#pragma mark - Logging (cached FD, thread-safe, hemat I/O main thread)
 
 static int gLogFD = -1;
 static NSObject *gLogLock;
 static NSString *gLogHomeSnapshot;
+static BOOL gLogHomeFrozen = NO;
 
-static void ensureLogFile(void) {
+static void openOrRefreshLogFileLocked(BOOL forceCheck) {
+    if (gLogFD >= 0 && gLogHomeFrozen && !forceCheck) return;
+    NSString *home = NSHomeDirectory();
+    if (!home.length) return;
+    if (gLogFD >= 0 && [gLogHomeSnapshot isEqualToString:home]) return;
+    if (gLogFD >= 0) { close(gLogFD); gLogFD = -1; }
+    NSString *docs = [home stringByAppendingPathComponent:@"Documents"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:docs
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *p = [docs stringByAppendingPathComponent:@"lcisolator.log"];
+    gLogFD = open(p.fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (gLogFD >= 0) gLogHomeSnapshot = [home copy];
+}
+
+static void refreshLogFile(BOOL freezeAfter) {
     @synchronized (gLogLock) {
-        NSString *home = NSHomeDirectory();
-        if (!home.length) return;
-        if (gLogFD >= 0 && [gLogHomeSnapshot isEqualToString:home]) return;
-        if (gLogFD >= 0) { close(gLogFD); gLogFD = -1; }
-        NSString *docs = [home stringByAppendingPathComponent:@"Documents"];
-        [[NSFileManager defaultManager] createDirectoryAtPath:docs
-                                  withIntermediateDirectories:YES attributes:nil error:nil];
-        NSString *p = [docs stringByAppendingPathComponent:@"lcisolator.log"];
-        gLogFD = open(p.fileSystemRepresentation, O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (gLogFD >= 0) gLogHomeSnapshot = [home copy];
+        openOrRefreshLogFileLocked(YES);
+        if (freezeAfter && gLogFD >= 0) gLogHomeFrozen = YES;
     }
 }
 
@@ -60,8 +103,10 @@ static void LCLog(NSString *fmt, ...) {
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     NSLog(@"[LCIsolator] %@", msg);
-    ensureLogFile();
     @synchronized (gLogLock) {
+        if (gLogFD < 0 || !gLogHomeFrozen) {
+            openOrRefreshLogFileLocked(NO);
+        }
         if (gLogFD >= 0) {
             NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
             const char *c = line.UTF8String;
@@ -202,6 +247,7 @@ static NSString *containerPrefix(void) {
     return [NSString stringWithFormat:@"lc.%@.", getContainerID()];
 }
 
+#if LC_ISOLATE_WEB_NET
 static NSUUID *uuidFromString(NSString *s) {
     NSUUID *u = [[NSUUID alloc] initWithUUIDString:s];
     if (u) return u;
@@ -212,7 +258,9 @@ static NSUUID *uuidFromString(NSString *s) {
     h[8] = (h[8] & 0x3F) | 0x80;
     return [[NSUUID alloc] initWithUUIDBytes:h];
 }
+#endif
 
+#if LC_ISOLATE_DEVICE_IDS
 // IDFV per container: TIDAK pernah memindai key LC_FakeIDFV_* milik container lain.
 static NSObject *gIDFVLock;
 static NSUUID *gCachedIDFV;
@@ -244,12 +292,21 @@ static NSUUID *fakeIDFV(void) {
     }
 }
 
+static NSString *containerHostName(void) {
+    NSString *cid = getContainerID();
+    NSString *shortID = cid.length > 8 ? [cid substringToIndex:8] : cid;
+    return [NSString stringWithFormat:@"iPhone-%@.local", shortID];
+}
+#endif
+
+#if LC_ENABLE_KEYCHAIN
 // Path keychain khusus cid ini (TIDAK pernah auto-copy keychain file container lain).
 static NSString *fakeKeychainPath(void) {
     return libPath([NSString stringWithFormat:@"lc_fake_keychain_%@.plist", getContainerID()]);
 }
+#endif
 
-#pragma mark - 1. Device Identifiers (IDFV, IDFA, UIDevice.name, NSProcessInfo.hostName)
+#pragma mark - 1. Device Identifiers (IDFV, IDFA, UIDevice.name, NSProcessInfo.hostName, gethostname)
 
 #if LC_ISOLATE_DEVICE_IDS
 static NSUUID *(*orig_identifierForVendor)(id, SEL);
@@ -267,9 +324,32 @@ static NSString *my_deviceName(id self, SEL _cmd) {
 static NSString *(*orig_hostName)(id, SEL);
 static NSString *my_hostName(id self, SEL _cmd) {
     (void)self; (void)_cmd;
-    NSString *cid = getContainerID();
-    NSString *shortID = cid.length > 8 ? [cid substringToIndex:8] : cid;
-    return [NSString stringWithFormat:@"iPhone-%@.local", shortID];
+    return containerHostName();
+}
+
+// Rebind C-API gethostname() (diimpor oleh Flutter.framework & Ojo.framework) agar sinkron dengan NSProcessInfo.hostName.
+static int (*orig_gethostname)(char *, size_t);
+static int my_gethostname(char *name, size_t namelen) {
+    if (!name || namelen == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    @autoreleasepool {
+        NSString *h = containerHostName();
+        const char *c = h.UTF8String;
+        if (c) {
+            size_t len = strlen(c);
+            if (len >= namelen) {
+                memcpy(name, c, namelen - 1);
+                name[namelen - 1] = '\0';
+                errno = ENAMETOOLONG;
+                return -1;
+            }
+            memcpy(name, c, len + 1);
+            return 0;
+        }
+    }
+    return orig_gethostname ? orig_gethostname(name, namelen) : -1;
 }
 
 static NSUUID *(*orig_advertisingIdentifier)(id, SEL);
@@ -294,6 +374,7 @@ static void installAdSupportHookIfLoaded(void) {
 
 #pragma mark - 2. App Group File Redirection (NSFileManager)
 
+#if LC_ENABLE_SWIZZLE
 static NSURL *(*orig_containerURLForGroup)(id, SEL, NSString *);
 static NSURL *my_containerURLForGroup(id self, SEL _cmd, NSString *gid) {
     if (!gid.length) return orig_containerURLForGroup(self, _cmd, gid);
@@ -302,35 +383,95 @@ static NSURL *my_containerURLForGroup(id self, SEL _cmd, NSString *gid) {
     [self createDirectoryAtPath:base withIntermediateDirectories:YES attributes:nil error:nil];
     return [NSURL fileURLWithPath:base isDirectory:YES];
 }
+#endif
 
-#pragma mark - 3. Selective NSUserDefaults (6 domain methods) & CFPreferences*
+#pragma mark - 3. Selective NSUserDefaults (6 domain methods + canary check) & CFPreferences*
 
 #if LC_ISOLATE_PREFS
 static __thread BOOL tInPrefs = NO;
+// 0 = persistentDomainForName:bid mengarah ke host & suite backing tidak dikenal (merge dictRep + scoped)
+// 1 = persistentDomainForName:bid sudah terikat ke guest oleh LiveContainer
+// 2 = standardUserDefaults diback oleh persistent domain cid/LCDataUUID (merge cid + scoped)
+static int gStdDomainMode = -1;
 
-static BOOL shouldScopeDomain(NSString *name) {
-    if (![name isKindOfClass:[NSString class]] || !name.length) return NO;
+static BOOL isSystemOrAlreadyScopedDomain(NSString *name) {
+    if (![name isKindOfClass:[NSString class]] || !name.length) return YES;
     if ([name isEqualToString:NSGlobalDomain] ||
         [name isEqualToString:NSArgumentDomain] ||
-        [name isEqualToString:NSRegistrationDomain]) return NO;
+        [name isEqualToString:NSRegistrationDomain]) return YES;
     if ([name hasPrefix:@"com.apple."] ||
         [name hasPrefix:@"Apple"] ||
-        [name hasPrefix:@".GlobalPreferences"]) return NO;
-    if ([name hasPrefix:@"lc."]) return NO;
-    // Jangan ubah domain bundle ID utama (sudah diisolasi oleh standardUserDefaults LiveContainer).
+        [name hasPrefix:@".GlobalPreferences"]) return YES;
+    if ([name hasPrefix:@"lc."]) return YES;
+    // Jangan double-scope jika LiveContainer sendiri membuka suite bernama LCDataUUID / containerID.
+    NSString *cid = getContainerID();
+    if (cid.length && [name isEqualToString:cid]) return YES;
+    return NO;
+}
+
+static BOOL isMainBundleID(NSString *name) {
     NSString *bid = [NSBundle mainBundle].bundleIdentifier;
-    if (bid.length && [name isEqualToString:bid]) return NO;
+    return (bid.length && [name isEqualToString:bid]);
+}
+
+// Untuk suite/remove/set eksplisit: bundle ID utama ("com.go-jek.gopay") TETAP di-scope!
+// Memperbaiki celah v10 pada FirebaseRemoteConfig (userDefaultsSuiteNameForBundleIdentifier:) & GoPay.
+static BOOL shouldScopeDomain(NSString *name, BOOL allowBundleID) {
+    if (isSystemOrAlreadyScopedDomain(name)) return NO;
+    if (!allowBundleID && isMainBundleID(name)) return NO;
     return YES;
 }
 
 static NSString *scopedDomain(NSString *name) {
-    if (!shouldScopeDomain(name)) return name;
+    if (isMainBundleID(name)) {
+        return [NSString stringWithFormat:@"lc.%@.app", getContainerID()];
+    }
     return [NSString stringWithFormat:@"lc.%@.%@", getContainerID(), name];
 }
 
 static id (*orig_udInitWithSuiteName)(id, SEL, NSString *);
+static void (*orig_udAddSuite)(id, SEL, NSString *);
+static void (*orig_udRemoveSuite)(id, SEL, NSString *);
+static NSDictionary *(*orig_udPersistentDomain)(id, SEL, NSString *);
+static void (*orig_udSetPersistentDomain)(id, SEL, NSDictionary *, NSString *);
+static void (*orig_udRemovePersistentDomain)(id, SEL, NSString *);
+
+// Canary probe thread-safe (dispatch_once): cek bagaimana LiveContainer mengikat standardUserDefaults.
+// Penting agar shared_preferences_foundation (LegacyUserDefaultsApi.getAll) tetap 100% konsisten
+// tanpa pernah membaca domain host com.go-jek.gopay dan tanpa menyembunyikan key flutter.*!
+static int detectStandardPersistentDomainMode(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSString *bid = [NSBundle mainBundle].bundleIdentifier;
+        NSString *cid = getContainerID();
+        if (!bid.length || !orig_udPersistentDomain) {
+            gStdDomainMode = 0;
+            return;
+        }
+        BOOL prev = tInPrefs;
+        tInPrefs = YES;
+        NSUserDefaults *std = [NSUserDefaults standardUserDefaults];
+        NSString *probeKey = [NSString stringWithFormat:@"_lc_dom_probe_%@", cid];
+        [std setObject:@"1" forKey:probeKey];
+        NSDictionary *domBid = orig_udPersistentDomain(std, @selector(persistentDomainForName:), bid);
+        if ([domBid[probeKey] isEqual:@"1"]) {
+            gStdDomainMode = 1;
+        } else {
+            NSDictionary *domCid = cid.length
+                ? orig_udPersistentDomain(std, @selector(persistentDomainForName:), cid)
+                : nil;
+            gStdDomainMode = [domCid[probeKey] isEqual:@"1"] ? 2 : 0;
+        }
+        [std removeObjectForKey:probeKey];
+        tInPrefs = prev;
+        LCLog(@"NSUserDefaults persistentDomain(%@) mode=%d (1=guestBid, 2=guestCID, 0=fallbackMerge)",
+              bid, gStdDomainMode);
+    });
+    return gStdDomainMode;
+}
+
 static id my_udInitWithSuiteName(id self, SEL _cmd, NSString *suiteName) {
-    if (tInPrefs || tInInternalIO || !shouldScopeDomain(suiteName)) {
+    if (tInPrefs || tInInternalIO || !shouldScopeDomain(suiteName, YES)) {
         return orig_udInitWithSuiteName(self, _cmd, suiteName);
     }
     tInPrefs = YES;
@@ -340,9 +481,8 @@ static id my_udInitWithSuiteName(id self, SEL _cmd, NSString *suiteName) {
     return r;
 }
 
-static void (*orig_udAddSuite)(id, SEL, NSString *);
 static void my_udAddSuite(id self, SEL _cmd, NSString *suiteName) {
-    if (tInPrefs || tInInternalIO || !shouldScopeDomain(suiteName)) {
+    if (tInPrefs || tInInternalIO || !shouldScopeDomain(suiteName, YES)) {
         orig_udAddSuite(self, _cmd, suiteName);
         return;
     }
@@ -351,9 +491,8 @@ static void my_udAddSuite(id self, SEL _cmd, NSString *suiteName) {
     tInPrefs = NO;
 }
 
-static void (*orig_udRemoveSuite)(id, SEL, NSString *);
 static void my_udRemoveSuite(id self, SEL _cmd, NSString *suiteName) {
-    if (tInPrefs || tInInternalIO || !shouldScopeDomain(suiteName)) {
+    if (tInPrefs || tInInternalIO || !shouldScopeDomain(suiteName, YES)) {
         orig_udRemoveSuite(self, _cmd, suiteName);
         return;
     }
@@ -362,9 +501,35 @@ static void my_udRemoveSuite(id self, SEL _cmd, NSString *suiteName) {
     tInPrefs = NO;
 }
 
-static NSDictionary *(*orig_udPersistentDomain)(id, SEL, NSString *);
 static NSDictionary *my_udPersistentDomain(id self, SEL _cmd, NSString *domainName) {
-    if (tInPrefs || tInInternalIO || !shouldScopeDomain(domainName)) {
+    if (tInPrefs || tInInternalIO) {
+        return orig_udPersistentDomain(self, _cmd, domainName);
+    }
+    // Ghidra (shared_preferences_foundation FUN_0000bbd8 + FUN_00009f08): SharedPreferencesPlugin membuat
+    // [[NSUserDefaults alloc] initWithSuiteName:nil] (instance BARU, bukan pointer standardUserDefaults) lalu
+    // memanggil persistentDomainForName:bundleIdentifier. Karena itu guard berlaku untuk SEMUA instance.
+    if (isMainBundleID(domainName)) {
+        int mode = detectStandardPersistentDomainMode();
+        if (mode == 1) {
+            return orig_udPersistentDomain(self, _cmd, domainName);
+        }
+        // LiveContainer mengisolasi standardUserDefaults via suite/file terpisah (mis. LCDataUUID),
+        // sehingga persistentDomainForName:bid mengarah ke host -> gabungkan backing guest + scoped!
+        tInPrefs = YES;
+        NSMutableDictionary *merged = [NSMutableDictionary dictionary];
+        if (mode == 2) {
+            NSDictionary *cidDom = orig_udPersistentDomain(self, _cmd, getContainerID());
+            if (cidDom.count) [merged addEntriesFromDictionary:cidDom];
+        } else {
+            NSDictionary *rep = [self dictionaryRepresentation];
+            if (rep.count) [merged addEntriesFromDictionary:rep];
+        }
+        NSDictionary *scoped = orig_udPersistentDomain(self, _cmd, scopedDomain(domainName));
+        if (scoped.count) [merged addEntriesFromDictionary:scoped];
+        tInPrefs = NO;
+        return merged.count ? [merged copy] : nil;
+    }
+    if (!shouldScopeDomain(domainName, YES)) {
         return orig_udPersistentDomain(self, _cmd, domainName);
     }
     tInPrefs = YES;
@@ -373,9 +538,8 @@ static NSDictionary *my_udPersistentDomain(id self, SEL _cmd, NSString *domainNa
     return r;
 }
 
-static void (*orig_udSetPersistentDomain)(id, SEL, NSDictionary *, NSString *);
 static void my_udSetPersistentDomain(id self, SEL _cmd, NSDictionary *domain, NSString *domainName) {
-    if (tInPrefs || tInInternalIO || !shouldScopeDomain(domainName)) {
+    if (tInPrefs || tInInternalIO || !shouldScopeDomain(domainName, YES)) {
         orig_udSetPersistentDomain(self, _cmd, domain, domainName);
         return;
     }
@@ -384,9 +548,8 @@ static void my_udSetPersistentDomain(id self, SEL _cmd, NSDictionary *domain, NS
     tInPrefs = NO;
 }
 
-static void (*orig_udRemovePersistentDomain)(id, SEL, NSString *);
 static void my_udRemovePersistentDomain(id self, SEL _cmd, NSString *domainName) {
-    if (tInPrefs || tInInternalIO || !shouldScopeDomain(domainName)) {
+    if (tInPrefs || tInInternalIO || !shouldScopeDomain(domainName, YES)) {
         orig_udRemovePersistentDomain(self, _cmd, domainName);
         return;
     }
@@ -396,6 +559,8 @@ static void my_udRemovePersistentDomain(id self, SEL _cmd, NSString *domainName)
 }
 
 // ---- C-API CFPreferences* (dipakai oleh APMUserDefaults di GoPay main binary) ----
+// CRITICAL FIX v11: kCFPreferencesCurrentApplication & bundleID ("com.go-jek.gopay")
+// SEKARANG ikut di-scope ke "lc.<cid>.app" agar APMUserDefaults tidak bocor ke host cfprefsd!
 static CFPropertyListRef (*orig_CFPreferencesCopyAppValue)(CFStringRef, CFStringRef);
 static void (*orig_CFPreferencesSetAppValue)(CFStringRef, CFPropertyListRef, CFStringRef);
 static CFArrayRef (*orig_CFPreferencesCopyKeyList)(CFStringRef, CFStringRef, CFStringRef);
@@ -404,39 +569,46 @@ static Boolean (*orig_CFPreferencesAppSynchronize)(CFStringRef);
 static void (*orig_CFPreferencesRemoveSuitePreferencesFromApp)(CFStringRef, CFStringRef);
 
 static NSString *maybeScopeCFAppID(CFStringRef appID) {
-    if (!appID ||
-        CFEqual(appID, kCFPreferencesCurrentApplication) ||
-        CFEqual(appID, kCFPreferencesAnyApplication)) {
+    if (!appID || CFEqual(appID, kCFPreferencesAnyApplication)) {
         return nil;
     }
+    if (CFEqual(appID, kCFPreferencesCurrentApplication)) {
+        return [NSString stringWithFormat:@"lc.%@.app", getContainerID()];
+    }
     NSString *s = (__bridge NSString *)appID;
-    return shouldScopeDomain(s) ? scopedDomain(s) : nil;
+    return shouldScopeDomain(s, YES) ? scopedDomain(s) : nil;
 }
 
 static CFPropertyListRef my_CFPreferencesCopyAppValue(CFStringRef key, CFStringRef appID) {
     if (tInPrefs || tInInternalIO) return orig_CFPreferencesCopyAppValue(key, appID);
-    tInPrefs = YES;
-    NSString *sc = maybeScopeCFAppID(appID);
-    CFPropertyListRef r = orig_CFPreferencesCopyAppValue(key, sc ? (__bridge CFStringRef)sc : appID);
-    tInPrefs = NO;
-    return r;
+    @autoreleasepool {
+        tInPrefs = YES;
+        NSString *sc = maybeScopeCFAppID(appID);
+        CFPropertyListRef r = orig_CFPreferencesCopyAppValue(key, sc ? (__bridge CFStringRef)sc : appID);
+        tInPrefs = NO;
+        return r;
+    }
 }
 
 static void my_CFPreferencesSetAppValue(CFStringRef key, CFPropertyListRef value, CFStringRef appID) {
     if (tInPrefs || tInInternalIO) { orig_CFPreferencesSetAppValue(key, value, appID); return; }
-    tInPrefs = YES;
-    NSString *sc = maybeScopeCFAppID(appID);
-    orig_CFPreferencesSetAppValue(key, value, sc ? (__bridge CFStringRef)sc : appID);
-    tInPrefs = NO;
+    @autoreleasepool {
+        tInPrefs = YES;
+        NSString *sc = maybeScopeCFAppID(appID);
+        orig_CFPreferencesSetAppValue(key, value, sc ? (__bridge CFStringRef)sc : appID);
+        tInPrefs = NO;
+    }
 }
 
 static CFArrayRef my_CFPreferencesCopyKeyList(CFStringRef appID, CFStringRef userName, CFStringRef hostName) {
     if (tInPrefs || tInInternalIO) return orig_CFPreferencesCopyKeyList(appID, userName, hostName);
-    tInPrefs = YES;
-    NSString *sc = maybeScopeCFAppID(appID);
-    CFArrayRef r = orig_CFPreferencesCopyKeyList(sc ? (__bridge CFStringRef)sc : appID, userName, hostName);
-    tInPrefs = NO;
-    return r;
+    @autoreleasepool {
+        tInPrefs = YES;
+        NSString *sc = maybeScopeCFAppID(appID);
+        CFArrayRef r = orig_CFPreferencesCopyKeyList(sc ? (__bridge CFStringRef)sc : appID, userName, hostName);
+        tInPrefs = NO;
+        return r;
+    }
 }
 
 static void my_CFPreferencesSetMultiple(CFDictionaryRef keysToSet, CFArrayRef keysToRemove,
@@ -445,19 +617,23 @@ static void my_CFPreferencesSetMultiple(CFDictionaryRef keysToSet, CFArrayRef ke
         orig_CFPreferencesSetMultiple(keysToSet, keysToRemove, appID, userName, hostName);
         return;
     }
-    tInPrefs = YES;
-    NSString *sc = maybeScopeCFAppID(appID);
-    orig_CFPreferencesSetMultiple(keysToSet, keysToRemove, sc ? (__bridge CFStringRef)sc : appID, userName, hostName);
-    tInPrefs = NO;
+    @autoreleasepool {
+        tInPrefs = YES;
+        NSString *sc = maybeScopeCFAppID(appID);
+        orig_CFPreferencesSetMultiple(keysToSet, keysToRemove, sc ? (__bridge CFStringRef)sc : appID, userName, hostName);
+        tInPrefs = NO;
+    }
 }
 
 static Boolean my_CFPreferencesAppSynchronize(CFStringRef appID) {
     if (tInPrefs || tInInternalIO) return orig_CFPreferencesAppSynchronize(appID);
-    tInPrefs = YES;
-    NSString *sc = maybeScopeCFAppID(appID);
-    Boolean r = orig_CFPreferencesAppSynchronize(sc ? (__bridge CFStringRef)sc : appID);
-    tInPrefs = NO;
-    return r;
+    @autoreleasepool {
+        tInPrefs = YES;
+        NSString *sc = maybeScopeCFAppID(appID);
+        Boolean r = orig_CFPreferencesAppSynchronize(sc ? (__bridge CFStringRef)sc : appID);
+        tInPrefs = NO;
+        return r;
+    }
 }
 
 static void my_CFPreferencesRemoveSuitePreferencesFromApp(CFStringRef appID, CFStringRef suiteID) {
@@ -465,29 +641,35 @@ static void my_CFPreferencesRemoveSuitePreferencesFromApp(CFStringRef appID, CFS
         orig_CFPreferencesRemoveSuitePreferencesFromApp(appID, suiteID);
         return;
     }
-    tInPrefs = YES;
-    NSString *scApp = maybeScopeCFAppID(appID);
-    NSString *scSuite = maybeScopeCFAppID(suiteID);
-    orig_CFPreferencesRemoveSuitePreferencesFromApp(scApp ? (__bridge CFStringRef)scApp : appID,
-                                                  scSuite ? (__bridge CFStringRef)scSuite : suiteID);
-    tInPrefs = NO;
+    @autoreleasepool {
+        tInPrefs = YES;
+        NSString *scApp = maybeScopeCFAppID(appID);
+        NSString *scSuite = maybeScopeCFAppID(suiteID);
+        orig_CFPreferencesRemoveSuitePreferencesFromApp(scApp ? (__bridge CFStringRef)scApp : appID,
+                                                      scSuite ? (__bridge CFStringRef)scSuite : suiteID);
+        tInPrefs = NO;
+    }
 }
 #endif
 
-#pragma mark - 4. Cookies, URLCache, URLCredentialStorage, URLSession, & WebView Isolation
+#pragma mark - 4. Cookies, URLCache, URLCredentialStorage, URLSession (shared/default/bg), & 5 WebView Engines
 
 #if LC_ISOLATE_WEB_NET
 static __thread BOOL tInNetIso = NO;
 static NSObject *gNetLock;
 static NSHTTPCookieStorage *gIsoCookieStorage;
 static NSString *gIsoCookieCID;
+static id gIsoCookieObserver;
 static dispatch_queue_t gCookieSaveQueue;
+static const void *kCookieSaveQueueKey = &kCookieSaveQueueKey;
 static BOOL gCookieSaveScheduled = NO;
 
 static NSURLCache *gIsoURLCache;
 static NSString *gIsoCacheCID;
 static NSURLCredentialStorage *gIsoCredStorage;
 static NSString *gIsoCredCID;
+static NSURLSession *gIsoSharedSession;
+static NSString *gIsoSharedSessionCID;
 
 static NSString *cookieStoreFilePath(void) {
     NSString *dir = libPath(@"Cookies");
@@ -522,7 +704,7 @@ static NSDictionary *plistSafeCookieProps(NSDictionary *src) {
     return out.count ? out : nil;
 }
 
-static void persistIsolatedCookiesNow(void) {
+static void persistIsolatedCookiesOnQueue(void) {
     NSHTTPCookieStorage *store = nil;
     @synchronized (gNetLock) { store = gIsoCookieStorage; }
     if (!store) return;
@@ -550,6 +732,17 @@ static void persistIsolatedCookiesNow(void) {
     }
 }
 
+static void persistIsolatedCookiesNow(void) {
+    if (!gCookieSaveQueue) return;
+    if (dispatch_get_specific(kCookieSaveQueueKey) == kCookieSaveQueueKey) {
+        persistIsolatedCookiesOnQueue();
+    } else {
+        dispatch_sync(gCookieSaveQueue, ^{
+            persistIsolatedCookiesOnQueue();
+        });
+    }
+}
+
 static void scheduleCookieSave(void) {
     if (!gCookieSaveQueue) return;
     dispatch_async(gCookieSaveQueue, ^{
@@ -557,14 +750,14 @@ static void scheduleCookieSave(void) {
         gCookieSaveScheduled = YES;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), gCookieSaveQueue, ^{
             gCookieSaveScheduled = NO;
-            persistIsolatedCookiesNow();
+            persistIsolatedCookiesOnQueue();
         });
     });
 }
 
 // Memakai ephemeralSessionConfiguration.HTTPCookieStorage -> instance NSHTTPCookieStorage ASLI
 // dengan CFHTTPCookieStorageRef privat (100% public API, kompatibel penuh dengan CFNetwork/NSURLSession/
-// NebulaWK PSDXMLHTTPREQUESTMESSAGE/WVWKCookieUtil/flutter_inappwebview_ios), dipersist ke file container.
+// NebulaWK PSDXMLHTTPREQUESTMESSAGE/WVWKCookieUtil/IAPMarketing/flutter_inappwebview_ios).
 static NSHTTPCookieStorage *isolatedCookieStorage(void) {
     NSString *cid = getContainerID();
     @synchronized (gNetLock) {
@@ -593,11 +786,17 @@ static NSHTTPCookieStorage *isolatedCookieStorage(void) {
 
         if (!gCookieSaveQueue) {
             gCookieSaveQueue = dispatch_queue_create("com.lcisolator.cookiesave", DISPATCH_QUEUE_SERIAL);
+            dispatch_queue_set_specific(gCookieSaveQueue, kCookieSaveQueueKey, (void *)kCookieSaveQueueKey, NULL);
         }
-        [[NSNotificationCenter defaultCenter] addObserverForName:NSHTTPCookieManagerCookiesChangedNotification
-                                                          object:store
-                                                           queue:nil
-                                                      usingBlock:^(NSNotification *n) {
+        if (gIsoCookieObserver) {
+            [[NSNotificationCenter defaultCenter] removeObserver:gIsoCookieObserver];
+            gIsoCookieObserver = nil;
+        }
+        gIsoCookieObserver = [[NSNotificationCenter defaultCenter]
+                              addObserverForName:NSHTTPCookieManagerCookiesChangedNotification
+                                          object:store
+                                           queue:nil
+                                      usingBlock:^(NSNotification *n) {
             (void)n;
             scheduleCookieSave();
         }];
@@ -660,14 +859,18 @@ static NSURLCache *my_sharedURLCache(id self, SEL _cmd) {
     return isolatedURLCache() ?: orig_sharedURLCache(self, _cmd);
 }
 
+// Proteksi v11: jangan izinkan caller menimpa gIsoURLCache dengan cache ber-diskPath host;
+// cukup salin kapasitasnya ke gIsoURLCache milik container!
 static void (*orig_setSharedURLCache)(id, SEL, NSURLCache *);
 static void my_setSharedURLCache(id self, SEL _cmd, NSURLCache *cache) {
     (void)self; (void)_cmd;
-    if (cache) {
-        @synchronized (gNetLock) {
-            gIsoURLCache = cache;
-            gIsoCacheCID = [getContainerID() copy];
-        }
+    if (!cache) return;
+    NSURLCache *iso = isolatedURLCache();
+    if (iso && cache != iso) {
+        iso.memoryCapacity = cache.memoryCapacity;
+        iso.diskCapacity = cache.diskCapacity;
+        LCLog(@"NSURLCache setSharedURLCache kapasitas disesuaikan (mem=%lu disk=%lu)",
+              (unsigned long)cache.memoryCapacity, (unsigned long)cache.diskCapacity);
     }
 }
 
@@ -690,60 +893,164 @@ static NSURLSessionConfiguration *my_defaultSessionConfig(id self, SEL _cmd) {
     return cfg;
 }
 
-// Isolasi identifier background URLSession agar tidak tabrakan di daemon nsurlsessiond
-// (dipakai GoPay, GoogleUtilities com.gul.network.background-upload, GTMSessionFetcher).
-static NSURLSessionConfiguration *(*orig_bgSessionConfig)(id, SEL, NSString *);
-static NSURLSessionConfiguration *my_bgSessionConfig(id self, SEL _cmd, NSString *identifier) {
-    NSString *scoped = identifier;
-    if (identifier.length && ![identifier hasPrefix:@"lc."]) {
-        scoped = [NSString stringWithFormat:@"lc.%@.%@", getContainerID(), identifier];
-    }
-    NSURLSessionConfiguration *cfg = orig_bgSessionConfig(self, _cmd, scoped);
-    if (!tInNetIso && cfg) {
+// CRITICAL FIX v11: Isolasi +[NSURLSession sharedSession] yang dipakai langsung oleh 8 biner
+// (GoPay, GotoNetworking, tagihan_unified_emoney [BCA Flazz/KMT], AppAuth, NaradSDK, Firebase*).
+static NSURLSession *(*orig_sharedSession)(id, SEL);
+static NSURLSession *isolatedSharedSession(void) {
+    NSString *cid = getContainerID();
+    @synchronized (gNetLock) {
+        if (gIsoSharedSession && [gIsoSharedSessionCID isEqualToString:cid]) return gIsoSharedSession;
+        BOOL prev = tInNetIso;
         tInNetIso = YES;
+        NSURLSessionConfiguration *cfg = orig_defaultSessionConfig
+            ? orig_defaultSessionConfig([NSURLSessionConfiguration class], @selector(defaultSessionConfiguration))
+            : [NSURLSessionConfiguration defaultSessionConfiguration];
         cfg.HTTPCookieStorage = isolatedCookieStorage();
         cfg.URLCache = isolatedURLCache();
         cfg.URLCredentialStorage = isolatedCredentialStorage();
-        tInNetIso = NO;
+        gIsoSharedSession = [NSURLSession sessionWithConfiguration:cfg];
+        gIsoSharedSessionCID = [cid copy];
+        tInNetIso = prev;
+        LCLog(@"NSURLSession.sharedSession ISOLATED (cid=%@)", cid);
+        return gIsoSharedSession;
+    }
+}
+
+static NSURLSession *my_sharedSession(id self, SEL _cmd) {
+    if (tInNetIso) return orig_sharedSession(self, _cmd);
+    return isolatedSharedSession() ?: orig_sharedSession(self, _cmd);
+}
+
+// Isolasi background URLSession agar tidak tabrakan di daemon nsurlsessiond
+// (dipakai GoPay, GoogleUtilities com.gul.network.background-upload, GTMSessionFetcher).
+// FIX v11: jangan memasang ephemeral cookie/credential store ke background session out-of-process,
+// dan bersihkan sharedContainerIdentifier agar tidak konflik App Group.
+// Ghidra: GULNetworkURLSession::handleEventsForBackgroundURLSessionID: (0xc4ec) & fetcherWithSessionIdentifier:
+// (0xde30) memakai [sessionID hasPrefix:kGULNetworkBackgroundSessionConfigIDPrefix]; GTMSessionFetcher juga
+// memakai hasPrefix:. Karena itu marker container dipasang sebagai SUFFIX (bukan prefix) agar hasPrefix tetap cocok,
+// dan suffix dilepas kembali saat iOS mengirim application:handleEventsForBackgroundURLSession: ke AppDelegate.
+static NSString *bgIdentifierSuffix(void) {
+    return [NSString stringWithFormat:@".lcbg-%@", getContainerID()];
+}
+
+static NSString *scopeBackgroundIdentifier(NSString *identifier) {
+    if (!identifier.length) return identifier;
+    NSString *sfx = bgIdentifierSuffix();
+    if ([identifier hasSuffix:sfx]) return identifier;
+    return [identifier stringByAppendingString:sfx];
+}
+
+static NSString *unscopeBackgroundIdentifier(NSString *identifier) {
+    if (![identifier isKindOfClass:[NSString class]]) return identifier;
+    NSString *sfx = bgIdentifierSuffix();
+    if ([identifier hasSuffix:sfx] && identifier.length > sfx.length) {
+        return [identifier substringToIndex:identifier.length - sfx.length];
+    }
+    return identifier;
+}
+
+static void (*orig_appHandleBgEvents)(id, SEL, UIApplication *, NSString *, void (^)(void));
+static void my_appHandleBgEvents(id self, SEL _cmd, UIApplication *app, NSString *identifier, void (^completion)(void)) {
+    NSString *mine = unscopeBackgroundIdentifier(identifier);
+    if (identifier.length && mine == identifier) {
+        // Event milik container lain (atau tanpa marker) -> jangan diteruskan ke SDK container ini.
+        NSString *sfxRoot = @".lcbg-";
+        if ([identifier rangeOfString:sfxRoot].location != NSNotFound) {
+            LCLog(@"bg URLSession event container lain diabaikan");
+            if (completion) completion();
+            return;
+        }
+    }
+    orig_appHandleBgEvents(self, _cmd, app, mine, completion);
+}
+
+static void installAppDelegateBgHookIfReady(void) {
+    static BOOL done = NO;
+    if (done) return;
+    id<UIApplicationDelegate> d = [UIApplication sharedApplication].delegate;
+    if (!d) return;
+    SEL sel = @selector(application:handleEventsForBackgroundURLSession:completionHandler:);
+    Class cls = [d class];
+    if (class_getInstanceMethod(cls, sel)) {
+        hookInstanceMethod(cls, sel, (IMP)my_appHandleBgEvents, (IMP *)&orig_appHandleBgEvents);
+    }
+    done = YES;
+}
+
+static NSURLSessionConfiguration *(*orig_bgSessionConfig)(id, SEL, NSString *);
+static NSURLSessionConfiguration *my_bgSessionConfig(id self, SEL _cmd, NSString *identifier) {
+    NSString *scoped = scopeBackgroundIdentifier(identifier);
+    NSURLSessionConfiguration *cfg = orig_bgSessionConfig(self, _cmd, scoped);
+    if (cfg) {
+        cfg.sharedContainerIdentifier = nil;
     }
     return cfg;
 }
 
-// ---- WKWebsiteDataStore + WKWebViewConfiguration + WKWebView + WKProcessPool ----
+// Variant deprecated masih direferensikan di GoPay main binary.
+static NSURLSessionConfiguration *(*orig_bgSessionConfigLegacy)(id, SEL, NSString *);
+static NSURLSessionConfiguration *my_bgSessionConfigLegacy(id self, SEL _cmd, NSString *identifier) {
+    NSString *scoped = scopeBackgroundIdentifier(identifier);
+    NSURLSessionConfiguration *cfg = orig_bgSessionConfigLegacy(self, _cmd, scoped);
+    if (cfg) {
+        cfg.sharedContainerIdentifier = nil;
+    }
+    return cfg;
+}
+
+// ---- WKWebsiteDataStore + WKWebViewConfiguration + WKWebView + WKContentRuleListStore ----
 static WKWebsiteDataStore *gIsoWKStore;
 static NSString *gIsoWKCID;
-static WKProcessPool *gIsoWKPool;
+#if LC_WEBVIEW_IOS16_ISOLATE
+static WKHTTPCookieStore *gIsoWKCookieStore;
+#endif
+static WKContentRuleListStore *gIsoRuleListStore;
+static NSString *gIsoRuleListCID;
 static __thread BOOL tInWKInit = NO;
+
+static WKWebsiteDataStore *(*orig_wkDefaultDataStore)(id, SEL);
+
+#if LC_WEBVIEW_IOS16_ISOLATE
+static void hydrateWKStoreCookiesOnIOS16(WKWebsiteDataStore *store) {
+    if (!store) return;
+    NSArray<NSHTTPCookie *> *cookies = [isolatedCookieStorage().cookies copy];
+    if (!cookies.count) return;
+    WKHTTPCookieStore *wkcs = store.httpCookieStore;
+    for (NSHTTPCookie *c in cookies) {
+        [wkcs setCookie:c completionHandler:nil];
+    }
+    LCLog(@"WKWebsiteDataStore(iOS<17) hydrate %lu cookies dari container", (unsigned long)cookies.count);
+}
+#endif
 
 static WKWebsiteDataStore *isolatedStore(void) {
     NSString *cid = getContainerID();
     if (gIsoWKStore && [gIsoWKCID isEqualToString:cid]) return gIsoWKStore;
     void (^make)(void) = ^{
         if (gIsoWKStore && [gIsoWKCID isEqualToString:cid]) return;
+        BOOL prev = tInWKInit;
+        tInWKInit = YES;
         if (@available(iOS 17.0, *)) {
             gIsoWKStore = [WKWebsiteDataStore dataStoreForIdentifier:uuidFromString(cid)];
+            LCLog(@"WKWebsiteDataStore: ISOLATED (iOS 17+ persistent uuid)");
         } else {
-#if LC_WEBVIEW_IOS16_NONPERSIST
+#if LC_WEBVIEW_IOS16_ISOLATE
             gIsoWKStore = [WKWebsiteDataStore nonPersistentDataStore];
+            gIsoWKCookieStore = gIsoWKStore.httpCookieStore;
+            hydrateWKStoreCookiesOnIOS16(gIsoWKStore);
+            LCLog(@"WKWebsiteDataStore: ISOLATED (iOS <17 nonPersistent + cookie sync)");
+#else
+            LCLog(@"WKWebsiteDataStore: TIDAK terisolasi (iOS <17, LC_WEBVIEW_IOS16_ISOLATE=0)");
 #endif
         }
         gIsoWKCID = [cid copy];
-        LCLog(@"WKWebsiteDataStore: %@", gIsoWKStore ? @"ISOLATED" : @"TIDAK terisolasi (iOS <17)");
+        tInWKInit = prev;
     };
     if ([NSThread isMainThread]) make();
     else dispatch_sync(dispatch_get_main_queue(), make);
     return gIsoWKStore;
 }
 
-static WKProcessPool *isolatedProcessPool(void) {
-    static dispatch_once_t t;
-    dispatch_once(&t, ^{
-        gIsoWKPool = [[WKProcessPool alloc] init];
-    });
-    return gIsoWKPool;
-}
-
-static WKWebsiteDataStore *(*orig_wkDefaultDataStore)(id, SEL);
 static WKWebsiteDataStore *my_wkDefaultDataStore(id self, SEL _cmd) {
     if (tInWKInit) return orig_wkDefaultDataStore(self, _cmd);
     tInWKInit = YES;
@@ -752,23 +1059,127 @@ static WKWebsiteDataStore *my_wkDefaultDataStore(id self, SEL _cmd) {
     return iso ?: orig_wkDefaultDataStore(self, _cmd);
 }
 
-// CRITICAL FIX: Pasang store & processPool container sejak WKWebViewConfiguration lahir!
-// Mencegah cookie yang diset ke cfg.websiteDataStore.httpCookieStore SEBELUM initWithFrame:configuration:
-// bocor ke store host lalu hilang saat store diganti.
+// CRITICAL FIX v11 (W3): Isolasi WKContentRuleListStore.defaultStore (dipakai flutter_inappwebview_ios contentBlockers).
+static WKContentRuleListStore *(*orig_wkRuleListDefaultStore)(id, SEL);
+static WKContentRuleListStore *isolatedRuleListStore(void) {
+    NSString *cid = getContainerID();
+    if (gIsoRuleListStore && [gIsoRuleListCID isEqualToString:cid]) return gIsoRuleListStore;
+    void (^make)(void) = ^{
+        if (gIsoRuleListStore && [gIsoRuleListCID isEqualToString:cid]) return;
+        NSString *dir = libPath([NSString stringWithFormat:@"WebKit/LCContentRuleLists_%@", cid]);
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        NSURL *u = [NSURL fileURLWithPath:dir isDirectory:YES];
+        gIsoRuleListStore = [WKContentRuleListStore storeWithURL:u];
+        gIsoRuleListCID = [cid copy];
+        LCLog(@"WKContentRuleListStore ISOLATED -> %@", dir.lastPathComponent);
+    };
+    if ([NSThread isMainThread]) make();
+    else dispatch_sync(dispatch_get_main_queue(), make);
+    return gIsoRuleListStore;
+}
+
+static WKContentRuleListStore *my_wkRuleListDefaultStore(id self, SEL _cmd) {
+    if (tInWKInit) return orig_wkRuleListDefaultStore(self, _cmd);
+    tInWKInit = YES;
+    WKContentRuleListStore *iso = isolatedRuleListStore();
+    tInWKInit = NO;
+    return iso ?: orig_wkRuleListDefaultStore(self, _cmd);
+}
+
+// Deteksi popup window.open / target="_blank" / 3DS / onCreateWindow (createWebViewWithConfiguration:).
+// WebKit melempar NSInvalidArgumentException jika websiteDataStore/processPool pada popup config dimutasi!
+static BOOL isRelatedPopupConfig(WKWebViewConfiguration *cfg) {
+    if (!cfg) return NO;
+    SEL relSel = NSSelectorFromString(@"_relatedWebView");
+    if ([cfg respondsToSelector:relSel]) {
+        id rel = ((id (*)(id, SEL))objc_msgSend)(cfg, relSel);
+        if (rel != nil) return YES;
+    }
+    return NO;
+}
+
+#if LC_FORCE_WEBVIEW_STORE
+// Identifikasi defaultDataStore host tanpa pernah memanggil orig_wkDefaultDataStore():
+// Di iOS 17+, defaultDataStore adalah satu-satunya store dengan isPersistent==YES && identifier==nil.
+// Di iOS <17, tidak ada dataStoreForIdentifier:, sehingga semua store persisten adalah defaultDataStore.
+static BOOL isHostDefaultWKStore(WKWebsiteDataStore *store) {
+    if (!store || !store.isPersistent) return NO;
+    if (@available(iOS 17.0, *)) {
+        return store.identifier == nil;
+    }
+    return YES;
+}
+#endif
+
+static void (*orig_wkCfgSetStore)(id, SEL, WKWebsiteDataStore *);
+static void my_wkCfgSetStore(id self, SEL _cmd, WKWebsiteDataStore *store) {
+#if LC_FORCE_WEBVIEW_STORE
+    if (!tInWKInit && isHostDefaultWKStore(store) && !isRelatedPopupConfig(self)) {
+        tInWKInit = YES;
+        WKWebsiteDataStore *iso = isolatedStore();
+        tInWKInit = NO;
+        if (iso) {
+            orig_wkCfgSetStore(self, _cmd, iso);
+            return;
+        }
+    }
+#endif
+    orig_wkCfgSetStore(self, _cmd, store);
+}
+
+static void applyIsolatedStoreToConfigIfNeeded(WKWebViewConfiguration *cfg) {
+#if LC_FORCE_WEBVIEW_STORE
+    if (!cfg || isRelatedPopupConfig(cfg)) return;
+    WKWebsiteDataStore *cur = cfg.websiteDataStore;
+    if (cur && !cur.isPersistent) return; // hormati incognito/nonPersistent
+    WKWebsiteDataStore *iso = isolatedStore();
+    if (iso && cur != iso) {
+        if (orig_wkCfgSetStore) orig_wkCfgSetStore(cfg, @selector(setWebsiteDataStore:), iso);
+        else cfg.websiteDataStore = iso;
+    }
+#else
+    (void)cfg;
+#endif
+}
+
+// Pasang store container sejak WKWebViewConfiguration lahir (init, initWithCoder:, copyWithZone:).
+// Catatan: pada iOS 15+, WKProcessPool sudah deprecated dan tidak memisahkan data lintas launch;
+// tidak menimpa processPool mencegah bentrok dengan WKProcessPoolManager milik flutter_inappwebview_ios.
 static id (*orig_wkCfgInit)(id, SEL);
 static id my_wkCfgInit(id self, SEL _cmd) {
     WKWebViewConfiguration *cfg = orig_wkCfgInit(self, _cmd);
     if (cfg && !tInWKInit) {
         tInWKInit = YES;
-#if LC_FORCE_WEBVIEW_STORE
-        WKWebsiteDataStore *iso = isolatedStore();
-        if (iso) cfg.websiteDataStore = iso;
-#endif
-        cfg.processPool = isolatedProcessPool();
+        applyIsolatedStoreToConfigIfNeeded(cfg);
         tInWKInit = NO;
     }
     return cfg;
 }
+
+static id (*orig_wkCfgInitCoder)(id, SEL, NSCoder *);
+static id my_wkCfgInitCoder(id self, SEL _cmd, NSCoder *coder) {
+    WKWebViewConfiguration *cfg = orig_wkCfgInitCoder(self, _cmd, coder);
+    if (cfg && !tInWKInit) {
+        tInWKInit = YES;
+        applyIsolatedStoreToConfigIfNeeded(cfg);
+        tInWKInit = NO;
+    }
+    return cfg;
+}
+
+static id (*orig_wkCfgCopyWithZone)(id, SEL, NSZone *);
+static id my_wkCfgCopyWithZone(id self, SEL _cmd, NSZone *zone) {
+    WKWebViewConfiguration *copy = orig_wkCfgCopyWithZone(self, _cmd, zone);
+    if (copy && !tInWKInit) {
+        tInWKInit = YES;
+        applyIsolatedStoreToConfigIfNeeded(copy);
+        tInWKInit = NO;
+    }
+    return copy;
+}
+
+static _Atomic int gWKInitLogCount = 0;
 
 static id (*orig_wkInitFrameCfg)(id, SEL, CGRect, WKWebViewConfiguration *);
 static id my_wkInitFrameCfg(id self, SEL _cmd, CGRect frame, WKWebViewConfiguration *configuration) {
@@ -782,34 +1193,47 @@ static id my_wkInitFrameCfg(id self, SEL _cmd, CGRect frame, WKWebViewConfigurat
     if (!configuration) {
 #if LC_FORCE_WEBVIEW_STORE
         configuration = [[WKWebViewConfiguration alloc] init];
-        if (iso) configuration.websiteDataStore = iso;
-        configuration.processPool = isolatedProcessPool();
-        state = iso ? @"nil-cfg -> DIBUAT store container" : @"nil-cfg (iOS <17)";
+        if (iso && configuration.websiteDataStore != iso) {
+            tInWKInit = YES;
+            if (orig_wkCfgSetStore) orig_wkCfgSetStore(configuration, @selector(setWebsiteDataStore:), iso);
+            else configuration.websiteDataStore = iso;
+            tInWKInit = NO;
+        }
+        state = iso ? @"nil-cfg -> DIBUAT store container" : @"nil-cfg (iOS <17 off)";
 #else
         state = @"nil-cfg (dibiarkan)";
 #endif
+    } else if (isRelatedPopupConfig(configuration)) {
+        // Popup 3DS/OAuth/onCreateWindow: JANGAN ubah websiteDataStore/processPool (cegah NSInvalidArgumentException)!
+        state = (iso && configuration.websiteDataStore == iso)
+            ? @"popup (_relatedWebView -> sudah store container)"
+            : @"popup (_relatedWebView -> dipertahankan aman)";
     } else {
         WKWebsiteDataStore *cur = configuration.websiteDataStore;
         if (!cur.isPersistent) {
-            state = @"non-persisten (dibiarkan)";
+            state = (iso && cur == iso) ? @"sudah store container (iOS<17)" : @"non-persisten/incognito (dibiarkan)";
         } else if (iso && cur == iso) {
             state = @"sudah store container";
         } else {
 #if LC_FORCE_WEBVIEW_STORE
             if (iso) {
-                configuration.websiteDataStore = iso;
+                tInWKInit = YES;
+                if (orig_wkCfgSetStore) orig_wkCfgSetStore(configuration, @selector(setWebsiteDataStore:), iso);
+                else configuration.websiteDataStore = iso;
+                tInWKInit = NO;
                 state = @"DIPAKSA ke store container";
             } else {
-                state = @"persisten, tidak bisa dipaksa (iOS <17)";
+                state = @"persisten, tidak bisa dipaksa (iOS <17 off)";
             }
 #else
             state = @"persisten, store bersama (LC_FORCE_WEBVIEW_STORE=0)";
 #endif
         }
-        if (!configuration.processPool) configuration.processPool = isolatedProcessPool();
     }
-    static int n = 0;
-    if (n++ < 40) LCLog(@"WKWebView init class=%@ store=%@", NSStringFromClass([self class]), state);
+    int c = atomic_fetch_add_explicit(&gWKInitLogCount, 1, memory_order_relaxed);
+    if (c < 200) {
+        LCLog(@"WKWebView init class=%@ store=%@", NSStringFromClass([self class]), state);
+    }
     return orig_wkInitFrameCfg(self, _cmd, frame, configuration);
 }
 
@@ -817,14 +1241,16 @@ static id (*orig_wkInitCoder)(id, SEL, NSCoder *);
 static id my_wkInitCoder(id self, SEL _cmd, NSCoder *coder) {
     WKWebView *wv = orig_wkInitCoder(self, _cmd, coder);
     if (wv) {
-        LCLog(@"WKWebView initWithCoder class=%@ persistent=%d",
-              NSStringFromClass([wv class]), (int)wv.configuration.websiteDataStore.isPersistent);
+        BOOL isIso = (gIsoWKStore && wv.configuration.websiteDataStore == gIsoWKStore);
+        LCLog(@"WKWebView initWithCoder class=%@ persistent=%d isolated=%@",
+              NSStringFromClass([wv class]), (int)wv.configuration.websiteDataStore.isPersistent,
+              isIso ? @"YA" : @"TIDAK");
     }
     return wv;
 }
 #endif
 
-#pragma mark - 5. Browser / OAuth Isolation & Trace (ASWebAuthenticationSession, SFSafariViewController)
+#pragma mark - 5. Browser / OAuth Isolation & Trace (ASWebAuthenticationSession, SFAuthenticationSession, SFSafariViewController)
 
 static id (*orig_asInit)(id, SEL, NSURL *, NSString *, id);
 static id my_asInit(id self, SEL _cmd, NSURL *url, NSString *scheme, id handler) {
@@ -841,15 +1267,76 @@ static id my_asInit(id self, SEL _cmd, NSURL *url, NSString *scheme, id handler)
     return obj;
 }
 
+// iOS 17.4+ API: initWithURL:callback:completionHandler:
+static id (*orig_asInitCallback)(id, SEL, NSURL *, id, id);
+static id my_asInitCallback(id self, SEL _cmd, NSURL *url, id callback, id handler) {
+#if LC_TRACE_WEB
+    LCLog(@"ASWebAuthenticationSession(iOS17.4) %@://%@", url.scheme ?: @"-", url.host ?: @"-");
+#endif
+    id obj = orig_asInitCallback(self, _cmd, url, callback, handler);
+#if LC_EPHEMERAL_WEBAUTH
+    SEL ephSel = NSSelectorFromString(@"setPrefersEphemeralWebBrowserSession:");
+    if (obj && [obj respondsToSelector:ephSel]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(obj, ephSel, YES);
+    }
+#endif
+    return obj;
+}
+
+#if LC_EPHEMERAL_WEBAUTH
+// CRITICAL FIX v11 (W1): flutter_inappwebview_ios & AppAuth memanggil setPrefersEphemeralWebBrowserSession:NO
+// SETELAH init selesai! Hook setter & start() memastikan sesi OAuth tetap ephemeral!
+static void (*orig_asSetEphemeral)(id, SEL, BOOL);
+static void my_asSetEphemeral(id self, SEL _cmd, BOOL flag) {
+    (void)flag;
+#if LC_TRACE_WEB
+    if (!flag) LCLog(@"ASWebAuthenticationSession setPrefersEphemeral:NO -> DIPAKSA YES");
+#endif
+    orig_asSetEphemeral(self, _cmd, YES);
+}
+
+static BOOL (*orig_asStart)(id, SEL);
+static BOOL my_asStart(id self, SEL _cmd) {
+    SEL ephSel = NSSelectorFromString(@"setPrefersEphemeralWebBrowserSession:");
+    if ([self respondsToSelector:ephSel]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(self, ephSel, YES);
+    }
+    return orig_asStart(self, _cmd);
+}
+#endif
+
+#if LC_TRACE_WEB
+static id (*orig_sfAuthInit)(id, SEL, NSURL *, NSString *, id);
+static id my_sfAuthInit(id self, SEL _cmd, NSURL *url, NSString *scheme, id handler) {
+    LCLog(@"SFAuthenticationSession (legacy Safari sistem!) %@://%@ callback=%@",
+          url.scheme ?: @"-", url.host ?: @"-", scheme ?: @"-");
+    return orig_sfAuthInit(self, _cmd, url, scheme, handler);
+}
+
 static id (*orig_sfInit)(id, SEL, NSURL *, id);
 static id my_sfInit(id self, SEL _cmd, NSURL *url, id cfg) {
-#if LC_TRACE_WEB
-    LCLog(@"SFSafariViewController %@://%@", url.scheme ?: @"-", url.host ?: @"-");
-#endif
+    LCLog(@"SFSafariViewController(cfg) %@://%@", url.scheme ?: @"-", url.host ?: @"-");
     return orig_sfInit(self, _cmd, url, cfg);
 }
 
-#if LC_TRACE_WEB
+static id (*orig_sfInitReader)(id, SEL, NSURL *, BOOL);
+static id my_sfInitReader(id self, SEL _cmd, NSURL *url, BOOL reader) {
+    LCLog(@"SFSafariViewController(reader=%d) %@://%@", (int)reader, url.scheme ?: @"-", url.host ?: @"-");
+    return orig_sfInitReader(self, _cmd, url, reader);
+}
+
+static id (*orig_sfPrewarm)(id, SEL, NSArray *);
+static id my_sfPrewarm(id self, SEL _cmd, NSArray *urls) {
+    LCLog(@"SFSafariViewController prewarmConnections count=%lu", (unsigned long)urls.count);
+    return orig_sfPrewarm(self, _cmd, urls);
+}
+
+static void (*orig_sfClearWebsiteData)(id, SEL, void (^)(void));
+static void my_sfClearWebsiteData(id self, SEL _cmd, void (^completion)(void)) {
+    LCLog(@"SFSafariViewControllerDataStore clearWebsiteData dipanggil");
+    orig_sfClearWebsiteData(self, _cmd, completion);
+}
+
 static WKNavigation *(*orig_wkLoadRequest)(id, SEL, NSURLRequest *);
 static WKNavigation *my_wkLoadRequest(id self, SEL _cmd, NSURLRequest *req) {
     LCLog(@"WKWebView(%@) loadRequest %@://%@%@", NSStringFromClass([self class]),
@@ -857,10 +1344,54 @@ static WKNavigation *my_wkLoadRequest(id self, SEL _cmd, NSURLRequest *req) {
     return orig_wkLoadRequest(self, _cmd, req);
 }
 
+static WKNavigation *(*orig_wkLoadHTML)(id, SEL, NSString *, NSURL *);
+static WKNavigation *my_wkLoadHTML(id self, SEL _cmd, NSString *html, NSURL *baseURL) {
+    LCLog(@"WKWebView(%@) loadHTMLString len=%lu base=%@://%@", NSStringFromClass([self class]),
+          (unsigned long)html.length, baseURL.scheme ?: @"-", baseURL.host ?: @"-");
+    return orig_wkLoadHTML(self, _cmd, html, baseURL);
+}
+
+static WKNavigation *(*orig_wkLoadFile)(id, SEL, NSURL *, NSURL *);
+static WKNavigation *my_wkLoadFile(id self, SEL _cmd, NSURL *fileURL, NSURL *readAccessURL) {
+    LCLog(@"WKWebView(%@) loadFileURL %@", NSStringFromClass([self class]), fileURL.lastPathComponent ?: @"-");
+    return orig_wkLoadFile(self, _cmd, fileURL, readAccessURL);
+}
+
 static void (*orig_wkSetCookie)(id, SEL, NSHTTPCookie *, void (^)(void));
 static void my_wkSetCookie(id self, SEL _cmd, NSHTTPCookie *cookie, void (^handler)(void)) {
     LCLog(@"WKHTTPCookieStore setCookie name=%@ domain=%@", cookie.name, cookie.domain);
+#if LC_ISOLATE_WEB_NET && LC_WEBVIEW_IOS16_ISOLATE
+    if (@available(iOS 17.0, *)) {
+        // iOS 17+ persisten otomatis di dataStoreForIdentifier
+    } else if (cookie && gIsoWKCookieStore && self == gIsoWKCookieStore) {
+        [isolatedCookieStorage() setCookie:cookie];
+    }
+#endif
     orig_wkSetCookie(self, _cmd, cookie, handler);
+}
+
+static void (*orig_wkDeleteCookie)(id, SEL, NSHTTPCookie *, void (^)(void));
+static void my_wkDeleteCookie(id self, SEL _cmd, NSHTTPCookie *cookie, void (^handler)(void)) {
+    LCLog(@"WKHTTPCookieStore deleteCookie name=%@ domain=%@", cookie.name, cookie.domain);
+#if LC_ISOLATE_WEB_NET && LC_WEBVIEW_IOS16_ISOLATE
+    if (@available(iOS 17.0, *)) {
+    } else if (cookie && gIsoWKCookieStore && self == gIsoWKCookieStore) {
+        [isolatedCookieStorage() deleteCookie:cookie];
+    }
+#endif
+    orig_wkDeleteCookie(self, _cmd, cookie, handler);
+}
+
+static void (*orig_wkRemoveDataSince)(id, SEL, NSSet<NSString *> *, NSDate *, void (^)(void));
+static void my_wkRemoveDataSince(id self, SEL _cmd, NSSet<NSString *> *types, NSDate *date, void (^handler)(void)) {
+#if LC_ISOLATE_WEB_NET
+    BOOL isIso = (gIsoWKStore && self == gIsoWKStore);
+#else
+    BOOL isIso = NO;
+#endif
+    LCLog(@"WKWebsiteDataStore removeDataOfTypes count=%lu isolated=%@",
+          (unsigned long)types.count, isIso ? @"YA" : @"TIDAK");
+    orig_wkRemoveDataSince(self, _cmd, types, date, handler);
 }
 
 static void (*orig_wkAddMsgHandler)(id, SEL, id<WKScriptMessageHandler>, NSString *);
@@ -869,10 +1400,35 @@ static void my_wkAddMsgHandler(id self, SEL _cmd, id<WKScriptMessageHandler> han
     orig_wkAddMsgHandler(self, _cmd, handler, name);
 }
 
+static void (*orig_wkAddMsgHandlerWorld)(id, SEL, id<WKScriptMessageHandler>, id, NSString *);
+static void my_wkAddMsgHandlerWorld(id self, SEL _cmd, id<WKScriptMessageHandler> handler, id world, NSString *name) {
+    LCLog(@"WK JS message handler(world): %@", name);
+    orig_wkAddMsgHandlerWorld(self, _cmd, handler, world, name);
+}
+
 static void (*orig_appOpenURL)(id, SEL, NSURL *, NSDictionary *, void (^)(BOOL));
 static void my_appOpenURL(id self, SEL _cmd, NSURL *url, NSDictionary *options, void (^handler)(BOOL)) {
     LCLog(@"UIApplication openURL %@://%@", url.scheme ?: @"-", url.host ?: @"-");
     orig_appOpenURL(self, _cmd, url, options, handler);
+}
+#elif LC_ISOLATE_WEB_NET && LC_WEBVIEW_IOS16_ISOLATE
+// Jika LC_TRACE_WEB=0 tapi LC_WEBVIEW_IOS16_ISOLATE=1, tetap mirror cookie iOS<17.
+static void (*orig_wkSetCookie)(id, SEL, NSHTTPCookie *, void (^)(void));
+static void my_wkSetCookie(id self, SEL _cmd, NSHTTPCookie *cookie, void (^handler)(void)) {
+    if (@available(iOS 17.0, *)) {
+    } else if (cookie && gIsoWKCookieStore && self == gIsoWKCookieStore) {
+        [isolatedCookieStorage() setCookie:cookie];
+    }
+    orig_wkSetCookie(self, _cmd, cookie, handler);
+}
+
+static void (*orig_wkDeleteCookie)(id, SEL, NSHTTPCookie *, void (^)(void));
+static void my_wkDeleteCookie(id self, SEL _cmd, NSHTTPCookie *cookie, void (^handler)(void)) {
+    if (@available(iOS 17.0, *)) {
+    } else if (cookie && gIsoWKCookieStore && self == gIsoWKCookieStore) {
+        [isolatedCookieStorage() deleteCookie:cookie];
+    }
+    orig_wkDeleteCookie(self, _cmd, cookie, handler);
 }
 #endif
 
@@ -882,28 +1438,68 @@ static void installBrowserHooksIfLoaded(void) {
         hookInstanceMethod(asCls,
                            NSSelectorFromString(@"initWithURL:callbackURLScheme:completionHandler:"),
                            (IMP)my_asInit, (IMP *)&orig_asInit);
+        if (class_getInstanceMethod(asCls, NSSelectorFromString(@"initWithURL:callback:completionHandler:"))) {
+            hookInstanceMethod(asCls,
+                               NSSelectorFromString(@"initWithURL:callback:completionHandler:"),
+                               (IMP)my_asInitCallback, (IMP *)&orig_asInitCallback);
+        }
+#if LC_EPHEMERAL_WEBAUTH
+        hookInstanceMethod(asCls,
+                           NSSelectorFromString(@"setPrefersEphemeralWebBrowserSession:"),
+                           (IMP)my_asSetEphemeral, (IMP *)&orig_asSetEphemeral);
+        hookInstanceMethod(asCls,
+                           NSSelectorFromString(@"start"),
+                           (IMP)my_asStart, (IMP *)&orig_asStart);
+#endif
     }
 #if LC_TRACE_WEB
+    Class sfAuthCls = NSClassFromString(@"SFAuthenticationSession");
+    if (sfAuthCls) {
+        hookInstanceMethod(sfAuthCls,
+                           NSSelectorFromString(@"initWithURL:callbackURLScheme:completionHandler:"),
+                           (IMP)my_sfAuthInit, (IMP *)&orig_sfAuthInit);
+    }
     Class sfCls = NSClassFromString(@"SFSafariViewController");
     if (sfCls) {
         hookInstanceMethod(sfCls,
                            NSSelectorFromString(@"initWithURL:configuration:"),
                            (IMP)my_sfInit, (IMP *)&orig_sfInit);
+        hookInstanceMethod(sfCls,
+                           NSSelectorFromString(@"initWithURL:entersReaderIfAvailable:"),
+                           (IMP)my_sfInitReader, (IMP *)&orig_sfInitReader);
+        if (class_getClassMethod(sfCls, NSSelectorFromString(@"prewarmConnectionsToURLs:"))) {
+            hookClassMethod(sfCls,
+                            NSSelectorFromString(@"prewarmConnectionsToURLs:"),
+                            (IMP)my_sfPrewarm, (IMP *)&orig_sfPrewarm);
+        }
+    }
+    Class sfDS = NSClassFromString(@"SFSafariViewControllerDataStore");
+    if (sfDS) {
+        hookInstanceMethod(sfDS,
+                           NSSelectorFromString(@"clearWebsiteDataWithCompletionHandler:"),
+                           (IMP)my_sfClearWebsiteData, (IMP *)&orig_sfClearWebsiteData);
     }
 #endif
 }
 
-#pragma mark - 6. UIPasteboard Isolation (class-cluster safe: _UIConcretePasteboard + named pasteboards)
+#pragma mark - 6. UIPasteboard Isolation (class-cluster safe + Smart Payment Mode 3)
 
 #if LC_PASTEBOARD_MODE > 0
 static NSObject *gPBLock;
 static NSMutableArray<NSDictionary<NSString *, id> *> *gPBItems;
 static NSInteger gPBChangeCount = 0;
+static _Atomic BOOL gAppIsActive = NO;
 
 static BOOL isGeneralPB(UIPasteboard *pb) {
     if (!pb) return NO;
     return [pb.name isEqualToString:UIPasteboardNameGeneral];
 }
+
+#if LC_PASTEBOARD_MODE == 3
+static BOOL allowInteractiveGeneralPB(void) {
+    return atomic_load_explicit(&gAppIsActive, memory_order_relaxed);
+}
+#endif
 
 static UIPasteboard *(*orig_pbWithName)(id, SEL, UIPasteboardName, BOOL);
 static UIPasteboard *my_pbWithName(id self, SEL _cmd, UIPasteboardName name, BOOL create) {
@@ -921,6 +1517,9 @@ static NSString *my_pbString(id self, SEL _cmd) {
     if (!isGeneralPB(self)) return orig_pbString(self, _cmd);
 #if LC_PASTEBOARD_MODE == 2
     return @"";
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) return orig_pbString(self, _cmd);
+    return nil;
 #else
     @synchronized (gPBLock) {
         for (NSDictionary *item in gPBItems) {
@@ -944,6 +1543,11 @@ static void my_pbSetString(id self, SEL _cmd, NSString *s) {
         if (s) [gPBItems addObject:@{ @"public.utf8-plain-text": [s copy] }];
         gPBChangeCount++;
     }
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) {
+        orig_pbSetString(self, _cmd, s);
+        @synchronized (gPBLock) { gPBChangeCount++; }
+    }
 #endif
 }
 
@@ -952,6 +1556,9 @@ static NSArray<NSString *> *my_pbStrings(id self, SEL _cmd) {
     if (!isGeneralPB(self)) return orig_pbStrings(self, _cmd);
 #if LC_PASTEBOARD_MODE == 2
     return @[];
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) return orig_pbStrings(self, _cmd);
+    return nil;
 #else
     @synchronized (gPBLock) {
         NSMutableArray *out = [NSMutableArray array];
@@ -977,6 +1584,11 @@ static void my_pbSetStrings(id self, SEL _cmd, NSArray<NSString *> *arr) {
         }
         gPBChangeCount++;
     }
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) {
+        orig_pbSetStrings(self, _cmd, arr);
+        @synchronized (gPBLock) { gPBChangeCount++; }
+    }
 #endif
 }
 
@@ -984,6 +1596,9 @@ static BOOL (*orig_pbHasStrings)(id, SEL);
 static BOOL my_pbHasStrings(id self, SEL _cmd) {
     if (!isGeneralPB(self)) return orig_pbHasStrings(self, _cmd);
 #if LC_PASTEBOARD_MODE == 2
+    return NO;
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) return orig_pbHasStrings(self, _cmd);
     return NO;
 #else
     return my_pbString(self, _cmd).length > 0;
@@ -994,6 +1609,9 @@ static NSURL *(*orig_pbURL)(id, SEL);
 static NSURL *my_pbURL(id self, SEL _cmd) {
     if (!isGeneralPB(self)) return orig_pbURL(self, _cmd);
 #if LC_PASTEBOARD_MODE == 2
+    return nil;
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) return orig_pbURL(self, _cmd);
     return nil;
 #else
     @synchronized (gPBLock) {
@@ -1016,6 +1634,11 @@ static void my_pbSetURL(id self, SEL _cmd, NSURL *u) {
         if (u) [gPBItems addObject:@{ @"public.url": u, @"public.utf8-plain-text": u.absoluteString ?: @"" }];
         gPBChangeCount++;
     }
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) {
+        orig_pbSetURL(self, _cmd, u);
+        @synchronized (gPBLock) { gPBChangeCount++; }
+    }
 #endif
 }
 
@@ -1023,6 +1646,9 @@ static NSArray<NSURL *> *(*orig_pbURLs)(id, SEL);
 static NSArray<NSURL *> *my_pbURLs(id self, SEL _cmd) {
     if (!isGeneralPB(self)) return orig_pbURLs(self, _cmd);
 #if LC_PASTEBOARD_MODE == 2
+    return nil;
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) return orig_pbURLs(self, _cmd);
     return nil;
 #else
     @synchronized (gPBLock) {
@@ -1053,6 +1679,11 @@ static void my_pbSetURLs(id self, SEL _cmd, NSArray<NSURL *> *urls) {
         }
         gPBChangeCount++;
     }
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) {
+        orig_pbSetURLs(self, _cmd, urls);
+        @synchronized (gPBLock) { gPBChangeCount++; }
+    }
 #endif
 }
 
@@ -1060,6 +1691,9 @@ static BOOL (*orig_pbHasURLs)(id, SEL);
 static BOOL my_pbHasURLs(id self, SEL _cmd) {
     if (!isGeneralPB(self)) return orig_pbHasURLs(self, _cmd);
 #if LC_PASTEBOARD_MODE == 2
+    return NO;
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) return orig_pbHasURLs(self, _cmd);
     return NO;
 #else
     return my_pbURL(self, _cmd) != nil;
@@ -1070,6 +1704,9 @@ static UIImage *(*orig_pbImage)(id, SEL);
 static UIImage *my_pbImage(id self, SEL _cmd) {
     if (!isGeneralPB(self)) return orig_pbImage(self, _cmd);
 #if LC_PASTEBOARD_MODE == 2
+    return nil;
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) return orig_pbImage(self, _cmd);
     return nil;
 #else
     @synchronized (gPBLock) {
@@ -1092,6 +1729,11 @@ static void my_pbSetImage(id self, SEL _cmd, UIImage *img) {
         if (img) [gPBItems addObject:@{ @"public.image": img }];
         gPBChangeCount++;
     }
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) {
+        orig_pbSetImage(self, _cmd, img);
+        @synchronized (gPBLock) { gPBChangeCount++; }
+    }
 #endif
 }
 
@@ -1099,6 +1741,9 @@ static NSArray<UIImage *> *(*orig_pbImages)(id, SEL);
 static NSArray<UIImage *> *my_pbImages(id self, SEL _cmd) {
     if (!isGeneralPB(self)) return orig_pbImages(self, _cmd);
 #if LC_PASTEBOARD_MODE == 2
+    return nil;
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) return orig_pbImages(self, _cmd);
     return nil;
 #else
     @synchronized (gPBLock) {
@@ -1127,6 +1772,11 @@ static void my_pbSetImages(id self, SEL _cmd, NSArray<UIImage *> *imgs) {
         }
         gPBChangeCount++;
     }
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) {
+        orig_pbSetImages(self, _cmd, imgs);
+        @synchronized (gPBLock) { gPBChangeCount++; }
+    }
 #endif
 }
 
@@ -1134,6 +1784,9 @@ static BOOL (*orig_pbHasImages)(id, SEL);
 static BOOL my_pbHasImages(id self, SEL _cmd) {
     if (!isGeneralPB(self)) return orig_pbHasImages(self, _cmd);
 #if LC_PASTEBOARD_MODE == 2
+    return NO;
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) return orig_pbHasImages(self, _cmd);
     return NO;
 #else
     return my_pbImage(self, _cmd) != nil;
@@ -1144,6 +1797,9 @@ static NSArray<NSDictionary<NSString *, id> *> *(*orig_pbItems)(id, SEL);
 static NSArray<NSDictionary<NSString *, id> *> *my_pbItems(id self, SEL _cmd) {
     if (!isGeneralPB(self)) return orig_pbItems(self, _cmd);
 #if LC_PASTEBOARD_MODE == 2
+    return @[];
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) return orig_pbItems(self, _cmd);
     return @[];
 #else
     @synchronized (gPBLock) { return [gPBItems copy]; }
@@ -1159,13 +1815,17 @@ static void my_pbSetItems(id self, SEL _cmd, NSArray<NSDictionary<NSString *, id
         if ([items isKindOfClass:[NSArray class]]) [gPBItems addObjectsFromArray:items];
         gPBChangeCount++;
     }
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) {
+        orig_pbSetItems(self, _cmd, items);
+        @synchronized (gPBLock) { gPBChangeCount++; }
+    }
 #endif
 }
 
 static void (*orig_pbSetItemsOpts)(id, SEL, NSArray<NSDictionary<NSString *, id> *> *, NSDictionary *);
 static void my_pbSetItemsOpts(id self, SEL _cmd, NSArray<NSDictionary<NSString *, id> *> *items, NSDictionary *opts) {
-    // social_media_share memakai setItems:options: untuk kirim sticker ke Instagram/FB ->
-    // izinkan jika target adalah sticker eksternal Instagram/FB, isolasi selain itu.
+    // social_media_share memakai setItems:options: untuk kirim sticker ke Instagram/FB -> selalu izinkan.
     BOOL isSocialShare = NO;
     if ([items isKindOfClass:[NSArray class]]) {
         for (id d in items) {
@@ -1183,7 +1843,14 @@ static void my_pbSetItemsOpts(id self, SEL _cmd, NSArray<NSDictionary<NSString *
         orig_pbSetItemsOpts(self, _cmd, items, opts);
         return;
     }
+#if LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) {
+        orig_pbSetItemsOpts(self, _cmd, items, opts);
+        @synchronized (gPBLock) { gPBChangeCount++; }
+    }
+#else
     my_pbSetItems(self, _cmd, items);
+#endif
 }
 
 static void (*orig_pbAddItems)(id, SEL, NSArray<NSDictionary<NSString *, id> *> *);
@@ -1194,6 +1861,11 @@ static void my_pbAddItems(id self, SEL _cmd, NSArray<NSDictionary<NSString *, id
         if ([items isKindOfClass:[NSArray class]]) [gPBItems addObjectsFromArray:items];
         gPBChangeCount++;
     }
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) {
+        orig_pbAddItems(self, _cmd, items);
+        @synchronized (gPBLock) { gPBChangeCount++; }
+    }
 #endif
 }
 
@@ -1201,6 +1873,9 @@ static NSArray<NSString *> *(*orig_pbTypes)(id, SEL);
 static NSArray<NSString *> *my_pbTypes(id self, SEL _cmd) {
     if (!isGeneralPB(self)) return orig_pbTypes(self, _cmd);
 #if LC_PASTEBOARD_MODE == 2
+    return @[];
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) return orig_pbTypes(self, _cmd);
     return @[];
 #else
     @synchronized (gPBLock) {
@@ -1216,6 +1891,9 @@ static id my_pbValueForType(id self, SEL _cmd, NSString *type) {
     if (!isGeneralPB(self)) return orig_pbValueForType(self, _cmd, type);
 #if LC_PASTEBOARD_MODE == 2
     return nil;
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) return orig_pbValueForType(self, _cmd, type);
+    return nil;
 #else
     @synchronized (gPBLock) {
         for (NSDictionary *d in gPBItems) { if (d[type]) return d[type]; }
@@ -1228,6 +1906,9 @@ static NSData *(*orig_pbDataForType)(id, SEL, NSString *);
 static NSData *my_pbDataForType(id self, SEL _cmd, NSString *type) {
     if (!isGeneralPB(self)) return orig_pbDataForType(self, _cmd, type);
 #if LC_PASTEBOARD_MODE == 2
+    return nil;
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) return orig_pbDataForType(self, _cmd, type);
     return nil;
 #else
     id v = my_pbValueForType(self, _cmd, type);
@@ -1246,15 +1927,28 @@ static void my_pbSetValueForType(id self, SEL _cmd, id value, NSString *type) {
         if (value && type) [gPBItems addObject:@{ type: value }];
         gPBChangeCount++;
     }
+#elif LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) {
+        orig_pbSetValueForType(self, _cmd, value, type);
+        @synchronized (gPBLock) { gPBChangeCount++; }
+    }
 #endif
 }
 
 static void (*orig_pbSetDataForType)(id, SEL, NSData *, NSString *);
 static void my_pbSetDataForType(id self, SEL _cmd, NSData *data, NSString *type) {
     if (!isGeneralPB(self)) { orig_pbSetDataForType(self, _cmd, data, type); return; }
+#if LC_PASTEBOARD_MODE == 3
+    if (allowInteractiveGeneralPB()) {
+        orig_pbSetDataForType(self, _cmd, data, type);
+        @synchronized (gPBLock) { gPBChangeCount++; }
+    }
+#else
     my_pbSetValueForType(self, _cmd, data, type);
+#endif
 }
 
+// changeCount SELALU diisolasi di semua mode (1/2/3) untuk mencegah fingerprinting & polling lintas container!
 static NSInteger (*orig_pbChangeCount)(id, SEL);
 static NSInteger my_pbChangeCount(id self, SEL _cmd) {
     if (!isGeneralPB(self)) return orig_pbChangeCount(self, _cmd);
@@ -1295,7 +1989,7 @@ static void installPasteboardHooksOnClass(Class pbCls) {
 }
 #endif
 
-#pragma mark - 7. UNUserNotificationCenter Isolation (runtime lookup, tanpa link UserNotifications)
+#pragma mark - 7. UNUserNotificationCenter & System UI (shortcutItems + Badge Count) Isolation
 
 #if LC_ISOLATE_NOTIFICATIONS
 static NSString *scopeNotifID(NSString *nid) {
@@ -1430,10 +2124,62 @@ static void my_unRemoveAllDelivered(id self, SEL _cmd) {
         }
     });
 }
+#endif
 
+#if LC_ISOLATE_SYSTEM_UI
+static NSObject *gSysUILock;
+static NSArray<UIApplicationShortcutItem *> *gIsoShortcutItems;
+static NSInteger gIsoBadgeCount = 0;
+
+static void (*orig_setShortcutItems)(id, SEL, NSArray<UIApplicationShortcutItem *> *);
+static void my_setShortcutItems(id self, SEL _cmd, NSArray<UIApplicationShortcutItem *> *items) {
+    (void)self; (void)_cmd;
+    @synchronized (gSysUILock) {
+        gIsoShortcutItems = [items copy];
+    }
+}
+
+static NSArray<UIApplicationShortcutItem *> *(*orig_shortcutItems)(id, SEL);
+static NSArray<UIApplicationShortcutItem *> *my_shortcutItems(id self, SEL _cmd) {
+    (void)self; (void)_cmd;
+    @synchronized (gSysUILock) {
+        return gIsoShortcutItems ?: @[];
+    }
+}
+
+static void (*orig_setAppBadge)(id, SEL, NSInteger);
+static void my_setAppBadge(id self, SEL _cmd, NSInteger count) {
+    (void)self; (void)_cmd;
+    @synchronized (gSysUILock) {
+        gIsoBadgeCount = count;
+    }
+}
+
+static NSInteger (*orig_appBadge)(id, SEL);
+static NSInteger my_appBadge(id self, SEL _cmd) {
+    (void)self; (void)_cmd;
+    @synchronized (gSysUILock) {
+        return gIsoBadgeCount;
+    }
+}
+
+static void (*orig_unSetBadgeCount)(id, SEL, NSInteger, void (^)(NSError *));
+static void my_unSetBadgeCount(id self, SEL _cmd, NSInteger count, void (^completion)(NSError *)) {
+    (void)self; (void)_cmd;
+    @synchronized (gSysUILock) {
+        gIsoBadgeCount = count;
+    }
+    if (completion) {
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(nil); });
+    }
+}
+#endif
+
+#if LC_ISOLATE_NOTIFICATIONS || LC_ISOLATE_SYSTEM_UI
 static void installNotificationHooksIfLoaded(void) {
     Class un = NSClassFromString(@"UNUserNotificationCenter");
     if (!un) return;
+#if LC_ISOLATE_NOTIFICATIONS
     hookInstanceMethod(un, NSSelectorFromString(@"addNotificationRequest:withCompletionHandler:"),
                        (IMP)my_unAddReq, (IMP *)&orig_unAddReq);
     hookInstanceMethod(un, NSSelectorFromString(@"getPendingNotificationRequestsWithCompletionHandler:"),
@@ -1448,11 +2194,19 @@ static void installNotificationHooksIfLoaded(void) {
                        (IMP)my_unRemoveAllPending, (IMP *)&orig_unRemoveAllPending);
     hookInstanceMethod(un, NSSelectorFromString(@"removeAllDeliveredNotifications"),
                        (IMP)my_unRemoveAllDelivered, (IMP *)&orig_unRemoveAllDelivered);
+#endif
+#if LC_ISOLATE_SYSTEM_UI
+    if (class_getInstanceMethod(un, NSSelectorFromString(@"setBadgeCount:withCompletionHandler:"))) {
+        hookInstanceMethod(un, NSSelectorFromString(@"setBadgeCount:withCompletionHandler:"),
+                           (IMP)my_unSetBadgeCount, (IMP *)&orig_unSetBadgeCount);
+    }
+#endif
 }
 #endif
 
-#pragma mark - 8. Hardened Keychain Isolation (Passwords + kSecClassKey + Cert/Identity + SecKeyGeneratePair)
+#pragma mark - 8. Hardened Keychain Isolation (Passwords + 2-Phase kSecClassKey + Cert/Identity + SecKeyGeneratePair)
 
+#if LC_ENABLE_KEYCHAIN
 static NSObject *gLock;
 static NSMutableDictionary *gKC;
 static NSString *gKCCID;
@@ -1531,6 +2285,11 @@ static void stripForeignAccessGroup(NSMutableDictionary *m) {
     [m removeObjectForKey:(__bridge id)kSecAttrAccessGroup];
 }
 
+static BOOL isExplicitlyNonPermanent(NSDictionary *d) {
+    id perm = d[(__bridge id)kSecAttrIsPermanent];
+    return ([perm isKindOfClass:[NSNumber class]] && ![perm boolValue]);
+}
+
 static NSDictionary *scopeKeyDict(NSDictionary *d, BOOL forceTag) {
     if (!d) return nil;
     NSMutableDictionary *m = [d mutableCopy];
@@ -1538,7 +2297,7 @@ static NSDictionary *scopeKeyDict(NSDictionary *d, BOOL forceTag) {
     id tag = m[(__bridge id)kSecAttrApplicationTag];
     if (tag) {
         m[(__bridge id)kSecAttrApplicationTag] = scopedTag(tag);
-    } else if (forceTag) {
+    } else if (forceTag && !isExplicitlyNonPermanent(m)) {
         m[(__bridge id)kSecAttrApplicationTag] = tagPrefixData();
     }
     if ([m[(__bridge id)kSecAttrLabel] isKindOfClass:[NSString class]]) {
@@ -1547,17 +2306,34 @@ static NSDictionary *scopeKeyDict(NSDictionary *d, BOOL forceTag) {
     return m;
 }
 
+static BOOL isExplicitlyPermanent(NSDictionary *d) {
+    id perm = d[(__bridge id)kSecAttrIsPermanent];
+    return ([perm isKindOfClass:[NSNumber class]] && [perm boolValue]);
+}
+
+// FIX v11 (K4): hormati kSecAttrIsPermanent = @NO (kunci ephemeral in-memory tidak perlu dipaksa tag).
+// Ghidra (GotoUtils CryptoRSAManager.generateRSAKeyPair @0x8c38): SecKeyGeneratePair dipanggil hanya dengan
+// kSecAttrKeyType + kSecAttrKeySizeInBits (tanpa kSecAttrIsPermanent -> default Apple = TIDAK disimpan).
+// Karena itu tag paksa hanya dipasang jika ada kSecAttrIsPermanent = @YES (top-level atau sub-dict).
 static NSDictionary *scopeKeyParams(NSDictionary *p, BOOL forceTag) {
     if (!p) return nil;
+    BOOL anyPermanent = isExplicitlyPermanent(p);
+    for (id sub in @[(__bridge id)kSecPrivateKeyAttrs, (__bridge id)kSecPublicKeyAttrs]) {
+        NSDictionary *sd = p[sub];
+        if ([sd isKindOfClass:[NSDictionary class]] && isExplicitlyPermanent(sd)) anyPermanent = YES;
+    }
+    forceTag = forceTag && anyPermanent;
+    BOOL topNonPerm = isExplicitlyNonPermanent(p);
     BOOL hasSubDict = NO;
     for (id sub in @[(__bridge id)kSecPrivateKeyAttrs, (__bridge id)kSecPublicKeyAttrs]) {
         if ([p[sub] isKindOfClass:[NSDictionary class]]) hasSubDict = YES;
     }
-    NSMutableDictionary *m = [scopeKeyDict(p, forceTag && !hasSubDict) mutableCopy];
+    NSMutableDictionary *m = [scopeKeyDict(p, forceTag && !hasSubDict && !topNonPerm) mutableCopy];
     for (id sub in @[(__bridge id)kSecPrivateKeyAttrs, (__bridge id)kSecPublicKeyAttrs]) {
         NSDictionary *sd = m[sub];
         if ([sd isKindOfClass:[NSDictionary class]]) {
-            m[sub] = scopeKeyDict(sd, forceTag);
+            BOOL subForce = forceTag && !topNonPerm && !isExplicitlyNonPermanent(sd);
+            m[sub] = scopeKeyDict(sd, subForce);
         }
     }
     return m;
@@ -1642,12 +2418,19 @@ static id formatRealKeyItem(NSDictionary *it, NSDictionary *origQuery) {
     return clean[(__bridge id)kSecValueData];
 }
 
-// Aman untuk query kSecClassKey / Cert / Identity TANPA tag/label:
-// saring ketat hanya item milik container ini supaya tidak pernah membaca/menghapus kunci container lain!
+// CRITICAL FIX v11 (K2): 2-Phase filteredRealCopyMatching!
+// Fase 1: enumerasi metadata HANYA dengan kSecReturnAttributes + kSecReturnPersistentRef + kSecUseAuthenticationUISkip
+//         sehingga TIDAK PERNAH memicu prompt Face ID/Touch ID untuk kunci Secure Enclave milik container lain!
+// Fase 2: jika caller meminta kSecReturnRef/kSecReturnData, ambil ulang HANYA untuk persistentRef milik container ini.
 static OSStatus filteredRealCopyMatching(NSDictionary *q, CFTypeRef *result, BOOL byLabel) {
     NSMutableDictionary *iq = [byLabel ? scopeCertDict(q, NO) : scopeKeyDict(q, NO) mutableCopy];
+    [iq removeObjectForKey:(__bridge id)kSecReturnData];
+    [iq removeObjectForKey:(__bridge id)kSecReturnRef];
+    [iq removeObjectForKey:(__bridge id)kSecUseAuthenticationContext];
     iq[(__bridge id)kSecReturnAttributes] = @YES;
+    iq[(__bridge id)kSecReturnPersistentRef] = @YES;
     iq[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitAll;
+    iq[(__bridge id)kSecUseAuthenticationUI] = (__bridge id)kSecUseAuthenticationUISkip;
 
     CFTypeRef raw = NULL;
     OSStatus st = orig_SecItemCopyMatching((__bridge CFDictionaryRef)iq, &raw);
@@ -1657,7 +2440,7 @@ static OSStatus filteredRealCopyMatching(NSDictionary *q, CFTypeRef *result, BOO
     }
     id obj = CFBridgingRelease(raw);
     NSArray *list = [obj isKindOfClass:[NSArray class]] ? obj : ([obj isKindOfClass:[NSDictionary class]] ? @[obj] : @[]);
-    NSMutableArray *mine = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *mine = [NSMutableArray array];
     for (id e in list) {
         if ([e isKindOfClass:[NSDictionary class]] && realItemBelongsToContainer(e, byLabel)) {
             [mine addObject:e];
@@ -1665,22 +2448,61 @@ static OSStatus filteredRealCopyMatching(NSDictionary *q, CFTypeRef *result, BOO
     }
     if (!mine.count) return errSecItemNotFound;
 
+    BOOL needSensitive = [q[(__bridge id)kSecReturnRef] boolValue] || [q[(__bridge id)kSecReturnData] boolValue];
     id lim = q[(__bridge id)kSecMatchLimit];
     BOOL wantMany = [lim isEqual:(__bridge id)kSecMatchLimitAll] ||
                     ([lim isKindOfClass:[NSNumber class]] && [lim integerValue] > 1);
-    if (result) {
-        if (wantMany) {
-            NSInteger cap = [lim isKindOfClass:[NSNumber class]] ? [lim integerValue] : (NSInteger)mine.count;
-            NSMutableArray *out = [NSMutableArray array];
-            for (NSInteger i = 0; i < (NSInteger)mine.count && i < cap; i++) {
-                id f = formatRealKeyItem(mine[i], q);
-                if (f) [out addObject:f];
+    NSInteger cap = wantMany
+        ? ([lim isKindOfClass:[NSNumber class]] ? [lim integerValue] : (NSInteger)mine.count)
+        : 1;
+
+    if (!result) return errSecSuccess;
+
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSInteger i = 0; i < (NSInteger)mine.count && i < cap; i++) {
+        NSDictionary *entry = mine[i];
+        if (needSensitive) {
+            NSData *pref = entry[(__bridge id)kSecValuePersistentRef];
+            if (!pref) continue;
+            NSMutableDictionary *fq = [NSMutableDictionary dictionary];
+            fq[(__bridge id)kSecValuePersistentRef] = pref;
+            if ([q[(__bridge id)kSecReturnData] boolValue])          fq[(__bridge id)kSecReturnData] = @YES;
+            if ([q[(__bridge id)kSecReturnRef] boolValue])           fq[(__bridge id)kSecReturnRef] = @YES;
+            if ([q[(__bridge id)kSecReturnAttributes] boolValue])    fq[(__bridge id)kSecReturnAttributes] = @YES;
+            if ([q[(__bridge id)kSecReturnPersistentRef] boolValue]) fq[(__bridge id)kSecReturnPersistentRef] = @YES;
+            if (q[(__bridge id)kSecUseAuthenticationContext])        fq[(__bridge id)kSecUseAuthenticationContext] = q[(__bridge id)kSecUseAuthenticationContext];
+            if (q[(__bridge id)kSecUseAuthenticationUI])             fq[(__bridge id)kSecUseAuthenticationUI] = q[(__bridge id)kSecUseAuthenticationUI];
+            if (q[(__bridge id)kSecUseDataProtectionKeychain])       fq[(__bridge id)kSecUseDataProtectionKeychain] = q[(__bridge id)kSecUseDataProtectionKeychain];
+            CFTypeRef itemRaw = NULL;
+            OSStatus ist = orig_SecItemCopyMatching((__bridge CFDictionaryRef)fq, &itemRaw);
+            if (ist == errSecSuccess && itemRaw) {
+                unscopeResult(&itemRaw);
+                id itemObj = CFBridgingRelease(itemRaw);
+                if (itemObj) [out addObject:itemObj];
+            } else if (itemRaw) {
+                CFRelease(itemRaw);
+            } else if (!wantMany && ist != errSecItemNotFound) {
+                return ist;
             }
-            *result = out.count ? CFRetain((__bridge CFTypeRef)out) : NULL;
         } else {
-            id f = formatRealKeyItem(mine[0], q);
-            *result = f ? CFRetain((__bridge CFTypeRef)f) : NULL;
+            id f = formatRealKeyItem(entry, q);
+            if (f) [out addObject:f];
         }
+    }
+
+    BOOL wantAnyReturn = [q[(__bridge id)kSecReturnData] boolValue] ||
+                         [q[(__bridge id)kSecReturnAttributes] boolValue] ||
+                         [q[(__bridge id)kSecReturnRef] boolValue] ||
+                         [q[(__bridge id)kSecReturnPersistentRef] boolValue];
+    if (wantAnyReturn && !out.count) {
+        *result = NULL;
+        return errSecItemNotFound;
+    }
+
+    if (wantMany) {
+        *result = out.count ? CFRetain((__bridge CFTypeRef)out) : NULL;
+    } else {
+        *result = out.count ? CFRetain((__bridge CFTypeRef)out[0]) : NULL;
     }
     return errSecSuccess;
 }
@@ -1689,9 +2511,11 @@ static OSStatus filteredRealDelete(NSDictionary *q, BOOL byLabel) {
     NSMutableDictionary *iq = [byLabel ? scopeCertDict(q, NO) : scopeKeyDict(q, NO) mutableCopy];
     [iq removeObjectForKey:(__bridge id)kSecReturnData];
     [iq removeObjectForKey:(__bridge id)kSecReturnRef];
+    [iq removeObjectForKey:(__bridge id)kSecUseAuthenticationContext];
     iq[(__bridge id)kSecReturnAttributes] = @YES;
     iq[(__bridge id)kSecReturnPersistentRef] = @YES;
     iq[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitAll;
+    iq[(__bridge id)kSecUseAuthenticationUI] = (__bridge id)kSecUseAuthenticationUISkip;
 
     CFTypeRef raw = NULL;
     OSStatus st = orig_SecItemCopyMatching((__bridge CFDictionaryRef)iq, &raw);
@@ -1718,9 +2542,11 @@ static OSStatus filteredRealUpdate(NSDictionary *q, NSDictionary *upd, BOOL byLa
     NSMutableDictionary *iq = [byLabel ? scopeCertDict(q, NO) : scopeKeyDict(q, NO) mutableCopy];
     [iq removeObjectForKey:(__bridge id)kSecReturnData];
     [iq removeObjectForKey:(__bridge id)kSecReturnRef];
+    [iq removeObjectForKey:(__bridge id)kSecUseAuthenticationContext];
     iq[(__bridge id)kSecReturnAttributes] = @YES;
     iq[(__bridge id)kSecReturnPersistentRef] = @YES;
     iq[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitAll;
+    iq[(__bridge id)kSecUseAuthenticationUI] = (__bridge id)kSecUseAuthenticationUISkip;
 
     CFTypeRef raw = NULL;
     OSStatus st = orig_SecItemCopyMatching((__bridge CFDictionaryRef)iq, &raw);
@@ -1779,10 +2605,17 @@ static BOOL itemSync(NSDictionary *d) {
     return [s isKindOfClass:[NSNumber class]] ? [s boolValue] : NO;
 }
 
+// CRITICAL FIX v11 (K1): Canonical UTF-8 untuk NSData vs NSString!
+// Terbukti di lcisolator.log baris 84-85 AppsFlyer mengirim kSecAttrAccount sebagai NSData UTF-8.
+// Menggunakan UTF-8 kanonik menyelaraskan kcKey() dengan attrEquals() (mencegah duplikasi key).
 static NSString *strOrEmpty(id v) {
     if (!v) return @"";
     if ([v isKindOfClass:[NSData class]]) {
-        return [(NSData *)v base64EncodedStringWithOptions:0];
+        NSData *d = (NSData *)v;
+        if (!d.length) return @"";
+        NSString *utf8 = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+        if (utf8) return utf8;
+        return [@"b64:" stringByAppendingString:[d base64EncodedStringWithOptions:0]];
     }
     return [NSString stringWithFormat:@"%@", v];
 }
@@ -1819,6 +2652,7 @@ static NSMutableDictionary *kcStore(void) { // panggil di dalam @synchronized(gL
             if ([parsed isKindOfClass:[NSDictionary class]]) d = parsed;
         }
         gKC = [NSMutableDictionary dictionary];
+        // Otomatis me-reindex key lama v10 (termasuk key Base64 NSData -> UTF-8 kanonik v11).
         [d enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
             (void)k; (void)stop;
             if ([v isKindOfClass:[NSDictionary class]]) {
@@ -1915,7 +2749,7 @@ static BOOL kcMatches(NSDictionary *item, NSDictionary *q) {
         if ([qs boolValue] != itemSync(item)) return NO;
     }
 
-    // kSecAttrAccessible: cocokkan hanya jika item punya nilai tersimpan (kompatibel legacy v9)
+    // kSecAttrAccessible: cocokkan hanya jika item punya nilai tersimpan (kompatibel legacy)
     id qAcc = q[(__bridge id)kSecAttrAccessible];
     if (qAcc && item[(__bridge id)kSecAttrAccessible] && ![item[(__bridge id)kSecAttrAccessible] isEqual:qAcc]) {
         return NO;
@@ -1961,11 +2795,14 @@ static id kcFormat(NSDictionary *item, NSDictionary *q) {
     return prefData;
 }
 
-static BOOL persistentRefExistsInFakeKC(NSDictionary *q) {
+// CRITICAL FIX v11 (K3): Kenali format persistentRef milik Fake Keychain meskipun itemnya sudah dihapus!
+// Mencegah query persistentRef yang sudah terhapus jatuh ke Keychain asli iOS.
+static BOOL isFakePersistentRefQuery(NSDictionary *q) {
     NSData *pref = q[(__bridge id)kSecValuePersistentRef];
-    if (![pref isKindOfClass:[NSData class]] || !pref.length) return NO;
+    if (![pref isKindOfClass:[NSData class]] || pref.length < 5) return NO;
     NSString *key = [[NSString alloc] initWithData:pref encoding:NSUTF8StringEncoding];
     if (!key.length) return NO;
+    if ([key hasPrefix:@"genp|"] || [key hasPrefix:@"inet|"]) return YES;
     @synchronized (gLock) {
         return kcStore()[key] != nil;
     }
@@ -2036,8 +2873,7 @@ static OSStatus my_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
     NSDictionary *q = (__bridge NSDictionary *)query;
     if (!q) return orig_SecItemCopyMatching(query, result);
 
-    // 1. Cek persistentRef di fake keychain DULU (query persistentRef sering tanpa kSecClass!)
-    BOOL isFakePRef = persistentRefExistsInFakeKC(q);
+    BOOL isFakePRef = isFakePersistentRefQuery(q);
     if (!isFakePRef && isKeyClass(q)) {
         BOOL hasDirectLookup = (q[(__bridge id)kSecAttrApplicationTag] != nil ||
                                 q[(__bridge id)kSecValuePersistentRef] != nil ||
@@ -2115,7 +2951,7 @@ static OSStatus my_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attrsToU
     NSDictionary *upd = (__bridge NSDictionary *)attrsToUpdate;
     if (!q) return orig_SecItemUpdate(query, attrsToUpdate);
 
-    BOOL isFakePRef = persistentRefExistsInFakeKC(q);
+    BOOL isFakePRef = isFakePersistentRefQuery(q);
     if (!isFakePRef && isKeyClass(q)) {
         BOOL hasDirectLookup = (q[(__bridge id)kSecAttrApplicationTag] != nil ||
                                 q[(__bridge id)kSecValuePersistentRef] != nil ||
@@ -2182,7 +3018,7 @@ static OSStatus my_SecItemDelete(CFDictionaryRef query) {
     NSDictionary *q = (__bridge NSDictionary *)query;
     if (!q) return orig_SecItemDelete(query);
 
-    BOOL isFakePRef = persistentRefExistsInFakeKC(q);
+    BOOL isFakePRef = isFakePersistentRefQuery(q);
     if (!isFakePRef && isKeyClass(q)) {
         BOOL hasDirectLookup = (q[(__bridge id)kSecAttrApplicationTag] != nil ||
                                 q[(__bridge id)kSecValuePersistentRef] != nil ||
@@ -2252,7 +3088,7 @@ static CFDictionaryRef my_SecKeyCopyAttributes(SecKeyRef key) {
     return (__bridge_retained CFDictionaryRef)clean;
 }
 
-#pragma mark - 9. Diagnostik Key / Biometrik
+#pragma mark - 9. Diagnostik Key / Biometrik (dengan dedup/throttle anti-spam)
 
 static CFDataRef (*orig_SecKeyCreateEncryptedData)(SecKeyRef, SecKeyAlgorithm, CFDataRef, CFErrorRef *);
 static CFDataRef (*orig_SecKeyCreateDecryptedData)(SecKeyRef, SecKeyAlgorithm, CFDataRef, CFErrorRef *);
@@ -2269,15 +3105,49 @@ static CFDataRef NAME(SecKeyRef key, SecKeyAlgorithm alg, CFDataRef data, CFErro
 LC_KEYOP(my_SecKeyCreateEncryptedData, orig_SecKeyCreateEncryptedData)
 LC_KEYOP(my_SecKeyCreateDecryptedData, orig_SecKeyCreateDecryptedData)
 LC_KEYOP(my_SecKeyCreateSignature, orig_SecKeyCreateSignature)
+#endif
 
 #if LC_TRACE_AUTH
+static NSObject *gAuthLogLock;
+static NSInteger gLastLAPolicy = -999;
+static BOOL gLastLAResult = NO;
+static NSInteger gLastLAErr = -999;
+static CFAbsoluteTime gLastLALogTime = 0;
+static NSUInteger gSuppressedLACount = 0;
+
 static BOOL (*orig_laCan)(id, SEL, NSInteger, NSError * __autoreleasing *);
 static BOOL my_laCan(id self, SEL _cmd, NSInteger policy, NSError * __autoreleasing *err) {
     NSError * __autoreleasing local = nil;
     BOOL r = orig_laCan(self, _cmd, policy, err ? err : &local);
     NSError *e = r ? nil : (err ? *err : local);
-    LCLog(@"LAContext canEvaluatePolicy policy=%ld -> %@ errcode=%ld",
-          (long)policy, r ? @"YA" : @"TIDAK", (long)e.code);
+    NSInteger code = e ? e.code : 0;
+
+    BOOL shouldLog = NO;
+    NSUInteger suppressed = 0;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    @synchronized (gAuthLogLock) {
+        BOOL changed = (policy != gLastLAPolicy || r != gLastLAResult || code != gLastLAErr);
+        if (changed || (now - gLastLALogTime) >= 10.0) {
+            shouldLog = YES;
+            suppressed = gSuppressedLACount;
+            gSuppressedLACount = 0;
+            gLastLAPolicy = policy;
+            gLastLAResult = r;
+            gLastLAErr = code;
+            gLastLALogTime = now;
+        } else {
+            gSuppressedLACount++;
+        }
+    }
+    if (shouldLog) {
+        if (suppressed > 0) {
+            LCLog(@"LAContext canEvaluatePolicy policy=%ld -> %@ errcode=%ld (suppressed=%lu)",
+                  (long)policy, r ? @"YA" : @"TIDAK", (long)code, (unsigned long)suppressed);
+        } else {
+            LCLog(@"LAContext canEvaluatePolicy policy=%ld -> %@ errcode=%ld",
+                  (long)policy, r ? @"YA" : @"TIDAK", (long)code);
+        }
+    }
     return r;
 }
 
@@ -2285,7 +3155,7 @@ static void (*orig_laEval)(id, SEL, NSInteger, NSString *, void (^)(BOOL, NSErro
 static void my_laEval(id self, SEL _cmd, NSInteger policy, NSString *reason, void (^reply)(BOOL, NSError *)) {
     LCLog(@"LAContext evaluatePolicy policy=%ld dimulai", (long)policy);
     orig_laEval(self, _cmd, policy, reason, ^(BOOL ok, NSError *e) {
-        LCLog(@"LAContext evaluatePolicy -> %@ errcode=%ld", ok ? @"BERHASIL" : @"GAGAL", (long)e.code);
+        LCLog(@"LAContext evaluatePolicy -> %@ errcode=%ld", ok ? @"BERHASIL" : @"GAGAL", (long)(e ? e.code : 0));
         if (reply) reply(ok, e);
     });
 }
@@ -2299,28 +3169,65 @@ static void installAuthTraceIfLoaded(void) {
                        (IMP)my_laEval, (IMP *)&orig_laEval);
 }
 
-static void logPermissionStatusIfLoaded(void) {
-    Class cn = NSClassFromString(@"CNContactStore");
-    if (cn) {
-        NSInteger st = ((NSInteger (*)(Class, SEL, NSInteger))objc_msgSend)(
-            cn, NSSelectorFromString(@"authorizationStatusForEntityType:"), 0);
-        LCLog(@"izin Kontak status=%ld", (long)st);
-    }
-    Class cl = NSClassFromString(@"CLLocationManager");
-    if (cl) {
-        int st = ((int (*)(Class, SEL))objc_msgSend)(cl, NSSelectorFromString(@"authorizationStatus"));
-        LCLog(@"izin Lokasi status=%d", st);
-    }
+static void logPermissionStatusOnce(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        Class cn = NSClassFromString(@"CNContactStore");
+        if (cn) {
+            NSInteger st = ((NSInteger (*)(Class, SEL, NSInteger))objc_msgSend)(
+                cn, NSSelectorFromString(@"authorizationStatusForEntityType:"), 0);
+            LCLog(@"izin Kontak status=%ld", (long)st);
+        }
+        Class cl = NSClassFromString(@"CLLocationManager");
+        if (cl) {
+            int st = ((int (*)(Class, SEL))objc_msgSend)(cl, NSSelectorFromString(@"authorizationStatus"));
+            LCLog(@"izin Lokasi status=%d", st);
+        }
+    });
 }
 #endif
 
-#pragma mark - Deferred Hooks (setelah UIApplication siap, tanpa force-dlopen di constructor)
+#pragma mark - Diagnostik Image Loading & Deferred Hooks
+
+static void logLoadedKeyFrameworksOnce(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        uint32_t total = _dyld_image_count();
+        NSArray<NSString *> *watch = @[
+            @"GoPay.app/GoPay",
+            @"flutter_inappwebview_ios",
+            @"flutter_secure_storage_darwin",
+            @"GotoLoginSSO",
+            @"GotoNetworking",
+            @"GoogleUtilities",
+            @"FirebaseInstallations",
+            @"tagihan_unified_emoney",
+        ];
+        NSMutableArray<NSString *> *found = [NSMutableArray array];
+        for (uint32_t i = 0; i < total; i++) {
+            const char *name = _dyld_get_image_name(i);
+            if (!name) continue;
+            NSString *s = [NSString stringWithUTF8String:name];
+            for (NSString *w in watch) {
+                if ([s containsString:w]) {
+                    [found addObject:w];
+                }
+            }
+        }
+        LCLog(@"dyld images=%u matched=%@", total, [found componentsJoinedByString:@","]);
+    });
+}
 
 static void installDeferredHooks(void) {
+#if LC_ENABLE_SWIZZLE
 #if LC_ISOLATE_WEB_NET
-    // Pre-warm di main thread setelah UIApplication siap (mencegah deadlock dispatch_sync dari background thread)
+    // Pre-warm di main thread sebelum Flutter/WebView dimulai (mencegah deadlock dispatch_sync).
     (void)isolatedStore();
-    (void)isolatedProcessPool();
+    (void)isolatedRuleListStore();
+    (void)isolatedSharedSession();
+#endif
+#if LC_ISOLATE_PREFS
+    (void)detectStandardPersistentDomainMode();
 #endif
 #if LC_ISOLATE_DEVICE_IDS
     installAdSupportHookIfLoaded();
@@ -2329,13 +3236,17 @@ static void installDeferredHooks(void) {
     // Pastikan subclass class cluster (_UIConcretePasteboard) ikut ter-hook
     installPasteboardHooksOnClass([UIPasteboard generalPasteboard].class);
 #endif
-#if LC_ISOLATE_NOTIFICATIONS
+#if LC_ISOLATE_NOTIFICATIONS || LC_ISOLATE_SYSTEM_UI
     installNotificationHooksIfLoaded();
 #endif
     installBrowserHooksIfLoaded();
+#if LC_ISOLATE_WEB_NET
+    installAppDelegateBgHookIfReady();
+#endif
+#endif
 #if LC_TRACE_AUTH
     installAuthTraceIfLoaded();
-    logPermissionStatusIfLoaded();
+    logPermissionStatusOnce();
 #endif
 }
 
@@ -2345,8 +3256,12 @@ __attribute__((constructor))
 static void lc_init(void) {
     gLogLock = [NSObject new];
     gCIDLock = [NSObject new];
+#if LC_ISOLATE_DEVICE_IDS
     gIDFVLock = [NSObject new];
+#endif
+#if LC_ENABLE_KEYCHAIN
     gLock = [NSObject new];
+#endif
 #if LC_ISOLATE_WEB_NET
     gNetLock = [NSObject new];
 #endif
@@ -2354,8 +3269,14 @@ static void lc_init(void) {
     gPBLock = [NSObject new];
     gPBItems = [NSMutableArray array];
 #endif
+#if LC_ISOLATE_SYSTEM_UI
+    gSysUILock = [NSObject new];
+#endif
+#if LC_TRACE_AUTH
+    gAuthLogLock = [NSObject new];
+#endif
 
-    LCLog(@"=== init v10 home=%@", NSHomeDirectory());
+    LCLog(@"=== init v11 home=%@ pbMode=%d", NSHomeDirectory(), LC_PASTEBOARD_MODE);
 
 #if LC_CRASH_LOG
     gPrevUncaughtHandler = NSGetUncaughtExceptionHandler();
@@ -2412,15 +3333,29 @@ static void lc_init(void) {
                     (IMP)my_setSharedURLCache, (IMP *)&orig_setSharedURLCache);
     hookClassMethod([NSURLCredentialStorage class], @selector(sharedCredentialStorage),
                     (IMP)my_sharedCredentialStorage, (IMP *)&orig_sharedCredentialStorage);
+    hookClassMethod([NSURLSession class], @selector(sharedSession),
+                    (IMP)my_sharedSession, (IMP *)&orig_sharedSession);
     hookClassMethod([NSURLSessionConfiguration class], @selector(defaultSessionConfiguration),
                     (IMP)my_defaultSessionConfig, (IMP *)&orig_defaultSessionConfig);
     hookClassMethod([NSURLSessionConfiguration class], @selector(backgroundSessionConfigurationWithIdentifier:),
                     (IMP)my_bgSessionConfig, (IMP *)&orig_bgSessionConfig);
+    if (class_getClassMethod([NSURLSessionConfiguration class], NSSelectorFromString(@"backgroundSessionConfiguration:"))) {
+        hookClassMethod([NSURLSessionConfiguration class], NSSelectorFromString(@"backgroundSessionConfiguration:"),
+                        (IMP)my_bgSessionConfigLegacy, (IMP *)&orig_bgSessionConfigLegacy);
+    }
 
     hookClassMethod([WKWebsiteDataStore class], @selector(defaultDataStore),
                     (IMP)my_wkDefaultDataStore, (IMP *)&orig_wkDefaultDataStore);
+    hookClassMethod([WKContentRuleListStore class], @selector(defaultStore),
+                    (IMP)my_wkRuleListDefaultStore, (IMP *)&orig_wkRuleListDefaultStore);
     hookInstanceMethod([WKWebViewConfiguration class], @selector(init),
                        (IMP)my_wkCfgInit, (IMP *)&orig_wkCfgInit);
+    hookInstanceMethod([WKWebViewConfiguration class], @selector(initWithCoder:),
+                       (IMP)my_wkCfgInitCoder, (IMP *)&orig_wkCfgInitCoder);
+    hookInstanceMethod([WKWebViewConfiguration class], @selector(copyWithZone:),
+                       (IMP)my_wkCfgCopyWithZone, (IMP *)&orig_wkCfgCopyWithZone);
+    hookInstanceMethod([WKWebViewConfiguration class], @selector(setWebsiteDataStore:),
+                       (IMP)my_wkCfgSetStore, (IMP *)&orig_wkCfgSetStore);
     hookInstanceMethod([WKWebView class], @selector(initWithFrame:configuration:),
                        (IMP)my_wkInitFrameCfg, (IMP *)&orig_wkInitFrameCfg);
     hookInstanceMethod([WKWebView class], @selector(initWithCoder:),
@@ -2434,7 +3369,18 @@ static void lc_init(void) {
     installPasteboardHooksOnClass(concretePB ?: [UIPasteboard class]);
 #endif
 
-#if LC_ISOLATE_NOTIFICATIONS
+#if LC_ISOLATE_SYSTEM_UI
+    hookInstanceMethod([UIApplication class], @selector(setShortcutItems:),
+                       (IMP)my_setShortcutItems, (IMP *)&orig_setShortcutItems);
+    hookInstanceMethod([UIApplication class], @selector(shortcutItems),
+                       (IMP)my_shortcutItems, (IMP *)&orig_shortcutItems);
+    hookInstanceMethod([UIApplication class], @selector(setApplicationIconBadgeNumber:),
+                       (IMP)my_setAppBadge, (IMP *)&orig_setAppBadge);
+    hookInstanceMethod([UIApplication class], @selector(applicationIconBadgeNumber),
+                       (IMP)my_appBadge, (IMP *)&orig_appBadge);
+#endif
+
+#if LC_ISOLATE_NOTIFICATIONS || LC_ISOLATE_SYSTEM_UI
     installNotificationHooksIfLoaded();
 #endif
     installBrowserHooksIfLoaded();
@@ -2443,12 +3389,31 @@ static void lc_init(void) {
 #if LC_TRACE_WEB
     hookInstanceMethod([WKWebView class], @selector(loadRequest:),
                        (IMP)my_wkLoadRequest, (IMP *)&orig_wkLoadRequest);
+    hookInstanceMethod([WKWebView class], @selector(loadHTMLString:baseURL:),
+                       (IMP)my_wkLoadHTML, (IMP *)&orig_wkLoadHTML);
+    hookInstanceMethod([WKWebView class], @selector(loadFileURL:allowingReadAccessToURL:),
+                       (IMP)my_wkLoadFile, (IMP *)&orig_wkLoadFile);
     hookInstanceMethod([WKHTTPCookieStore class], @selector(setCookie:completionHandler:),
                        (IMP)my_wkSetCookie, (IMP *)&orig_wkSetCookie);
+    hookInstanceMethod([WKHTTPCookieStore class], @selector(deleteCookie:completionHandler:),
+                       (IMP)my_wkDeleteCookie, (IMP *)&orig_wkDeleteCookie);
+    hookInstanceMethod([WKWebsiteDataStore class], @selector(removeDataOfTypes:modifiedSince:completionHandler:),
+                       (IMP)my_wkRemoveDataSince, (IMP *)&orig_wkRemoveDataSince);
     hookInstanceMethod([WKUserContentController class], @selector(addScriptMessageHandler:name:),
                        (IMP)my_wkAddMsgHandler, (IMP *)&orig_wkAddMsgHandler);
+    if (class_getInstanceMethod([WKUserContentController class],
+                                NSSelectorFromString(@"addScriptMessageHandler:contentWorld:name:"))) {
+        hookInstanceMethod([WKUserContentController class],
+                           NSSelectorFromString(@"addScriptMessageHandler:contentWorld:name:"),
+                           (IMP)my_wkAddMsgHandlerWorld, (IMP *)&orig_wkAddMsgHandlerWorld);
+    }
     hookInstanceMethod([UIApplication class], @selector(openURL:options:completionHandler:),
                        (IMP)my_appOpenURL, (IMP *)&orig_appOpenURL);
+#elif LC_ISOLATE_WEB_NET && LC_WEBVIEW_IOS16_ISOLATE
+    hookInstanceMethod([WKHTTPCookieStore class], @selector(setCookie:completionHandler:),
+                       (IMP)my_wkSetCookie, (IMP *)&orig_wkSetCookie);
+    hookInstanceMethod([WKHTTPCookieStore class], @selector(deleteCookie:completionHandler:),
+                       (IMP)my_wkDeleteCookie, (IMP *)&orig_wkDeleteCookie);
 #endif
 
 #if LC_TRACE_AUTH
@@ -2456,7 +3421,7 @@ static void lc_init(void) {
 #endif
 
     // Hook C symbols via fishhook (hanya sekali, mencakup semua image yang sudah & akan dimuat)
-    struct rebinding rebs[20];
+    struct rebinding rebs[24];
     size_t count = 0;
 #if LC_ENABLE_KEYCHAIN
     rebs[count++] = (struct rebinding){"SecItemAdd",                (void *)my_SecItemAdd,                (void **)&orig_SecItemAdd};
@@ -2478,24 +3443,60 @@ static void lc_init(void) {
     rebs[count++] = (struct rebinding){"CFPreferencesAppSynchronize",                (void *)my_CFPreferencesAppSynchronize,                (void **)&orig_CFPreferencesAppSynchronize};
     rebs[count++] = (struct rebinding){"CFPreferencesRemoveSuitePreferencesFromApp", (void *)my_CFPreferencesRemoveSuitePreferencesFromApp, (void **)&orig_CFPreferencesRemoveSuitePreferencesFromApp};
 #endif
+#if LC_ISOLATE_DEVICE_IDS
+    rebs[count++] = (struct rebinding){"gethostname", (void *)my_gethostname, (void **)&orig_gethostname};
+#endif
     if (count > 0) {
         int rc = rebind_symbols(rebs, count);
         LCLog(@"rebind_symbols count=%zu rc=%d", count, rc);
     }
 
-    // Hook framework opsional & simpan cookie saat app masuk background / selesai launch.
+    // Hook framework opsional & pre-warm WebKit seawal mungkin di main thread.
     dispatch_async(dispatch_get_main_queue(), ^{
         installDeferredHooks();
     });
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    [nc addObserverForName:UIApplicationWillFinishLaunchingNotification
+                    object:nil
+                     queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *n) {
+        (void)n;
+        refreshLogFile(NO);
+        installDeferredHooks();
+    }];
     [nc addObserverForName:UIApplicationDidFinishLaunchingNotification
                     object:nil
                      queue:[NSOperationQueue mainQueue]
                 usingBlock:^(NSNotification *n) {
         (void)n;
+        refreshLogFile(YES);
         LCLog(@"DidFinishLaunching container=%@ home=%@", getContainerID(), NSHomeDirectory());
         installDeferredHooks();
+        logLoadedKeyFrameworksOnce();
     }];
+#if LC_PASTEBOARD_MODE > 0
+    [nc addObserverForName:UIApplicationDidBecomeActiveNotification
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification *n) {
+        (void)n;
+        atomic_store_explicit(&gAppIsActive, YES, memory_order_relaxed);
+    }];
+    [nc addObserverForName:UIApplicationWillResignActiveNotification
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification *n) {
+        (void)n;
+        atomic_store_explicit(&gAppIsActive, NO, memory_order_relaxed);
+    }];
+    [nc addObserverForName:UIApplicationDidEnterBackgroundNotification
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification *n) {
+        (void)n;
+        atomic_store_explicit(&gAppIsActive, NO, memory_order_relaxed);
+    }];
+#endif
 #if LC_ISOLATE_WEB_NET
     [nc addObserverForName:UIApplicationWillResignActiveNotification
                     object:nil
@@ -2513,5 +3514,5 @@ static void lc_init(void) {
     }];
 #endif
 
-    LCLog(@"=== init v10 selesai");
+    LCLog(@"=== init v11 selesai");
 }
