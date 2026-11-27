@@ -13,48 +13,109 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Checkout fishhook
+      - name: Checkout fishhook (pinned commit with iOS 15+ VM_PROT_COPY fix)
         uses: actions/checkout@v4
         with:
           repository: facebook/fishhook
+          ref: aadc161ac3b80db07a9908851839a17ba63a9eb1
           path: fishhook-src
           fetch-depth: 1
+
+      - name: Verify fishhook VM_PROT_COPY support
+        run: |
+          set -euo pipefail
+          grep -q "VM_PROT_COPY" fishhook-src/fishhook.c \
+            || (echo "ERROR: fishhook.c tidak memiliki patch VM_PROT_COPY untuk __DATA_CONST"; exit 1)
+          echo "OK: fishhook.c mendukung VM_PROT_COPY"
 
       - name: Compile LCIsolator-gopay.dylib
         run: |
           set -euo pipefail
+          echo "=== Toolchain ==="
+          sw_vers
+          xcodebuild -version
+          clang --version
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          clang -arch arm64 \
-            -O2 \
-            -dynamiclib \
-            -fobjc-arc \
-            -isysroot "$SDK" \
-            -miphoneos-version-min=15.0 \
-            -Wno-deprecated-declarations \
-            -I fishhook-src \
-            -framework Foundation \
-            -framework CoreFoundation \
-            -framework UIKit \
-            -framework WebKit \
-            -framework Security \
-            -lobjc \
-            -Wl,-install_name,@rpath/LCIsolator-gopay.dylib \
+          echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-version) ($SDK)"
+
+          COMMON_FLAGS=(
+            -arch arm64
+            -O2
+            -dynamiclib
+            -fobjc-arc
+            -fvisibility=hidden
+            -Drebind_symbols=lc_rebind_symbols
+            -Drebind_symbols_image=lc_rebind_symbols_image
+            -isysroot "$SDK"
+            -miphoneos-version-min=15.0
+            -Wall
+            -Wextra
+            -Wunguarded-availability-new
+            -Werror=implicit-function-declaration
+            -Werror=objc-method-access
+            -Wno-deprecated-declarations
+            -I fishhook-src
+            -framework Foundation
+            -framework CoreFoundation
+            -framework UIKit
+            -framework WebKit
+            -framework Security
+            -lobjc
+            -Wl,-install_name,@rpath/LCIsolator-gopay.dylib
+          )
+
+          clang "${COMMON_FLAGS[@]}" \
             -o LCIsolator-gopay.dylib \
             LCIsolator.m \
             fishhook-src/fishhook.c
+
+          # Buang simbol lokal non-global agar biner bersih & tidak konflik dengan LiveContainer
+          strip -x LCIsolator-gopay.dylib
           # ad-hoc sign; LiveContainer akan sign ulang
           codesign -f -s - LCIsolator-gopay.dylib
+
+          echo "=== Smoke-compile bisecting modes (mode 1 + minimal trace) ==="
+          clang "${COMMON_FLAGS[@]}" \
+            -DLC_PASTEBOARD_MODE=1 \
+            -DLC_TRACE_WEB=0 \
+            -DLC_TRACE_AUTH=0 \
+            -o /tmp/LCIsolator-smoke.dylib \
+            LCIsolator.m \
+            fishhook-src/fishhook.c
+          rm -f /tmp/LCIsolator-smoke.dylib
+          echo "OK: smoke-compile bersih"
 
       - name: Verify dylib
         run: |
           set -euo pipefail
           file LCIsolator-gopay.dylib
-          echo "=== Dependencies (tidak boleh ada libdobby / path aneh) ==="
-          otool -L LCIsolator-gopay.dylib
+
+          echo "=== Arsitektur harus arm64 ==="
+          ARCHS=$(lipo -archs LCIsolator-gopay.dylib)
+          echo "Archs: $ARCHS"
+          test "$ARCHS" = "arm64" || (echo "ERROR: arsitektur bukan arm64: $ARCHS"; exit 1)
+
+          echo "=== Dependencies (hanya framework sistem Apple) ==="
+          DEPS=$(otool -L LCIsolator-gopay.dylib)
+          echo "$DEPS"
+          if echo "$DEPS" | grep -Eqi "dobby|substrate|ellekit|substitute|/usr/local|/opt/homebrew"; then
+            echo "ERROR: ditemukan dependency terlarang di otool -L"
+            exit 1
+          fi
+
+          echo "=== Exported global symbols (harus kosong / tanpa bocor _rebind_symbols) ==="
+          EXPORTS=$(nm -gU LCIsolator-gopay.dylib || true)
+          echo "${EXPORTS:-<none>}"
+          if [ -n "$EXPORTS" ]; then
+            echo "ERROR: terdapat simbol global terekspos (risiko bentrok dengan LiveContainer)"
+            exit 1
+          fi
+
           echo "=== Constructor harus ada ==="
           # linker baru memakai __init_offsets, linker lama memakai __mod_init_func
           otool -l LCIsolator-gopay.dylib | grep -E "mod_init_func|init_offsets" \
             || (echo "ERROR: tidak ada constructor"; exit 1)
+
           echo "=== Min OS ==="
           otool -l LCIsolator-gopay.dylib | grep -A4 LC_BUILD_VERSION || true
 
