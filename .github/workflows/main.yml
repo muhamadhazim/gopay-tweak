@@ -25,6 +25,7 @@ jobs:
           set -euo pipefail
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           clang -arch arm64 \
+            -O2 \
             -dynamiclib \
             -fobjc-arc \
             -isysroot "$SDK" \
@@ -32,6 +33,7 @@ jobs:
             -Wno-deprecated-declarations \
             -I fishhook-src \
             -framework Foundation \
+            -framework CoreFoundation \
             -framework UIKit \
             -framework WebKit \
             -framework Security \
