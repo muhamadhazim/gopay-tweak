@@ -2271,9 +2271,9 @@ LC_KEYOP(my_SecKeyCreateDecryptedData, orig_SecKeyCreateDecryptedData)
 LC_KEYOP(my_SecKeyCreateSignature, orig_SecKeyCreateSignature)
 
 #if LC_TRACE_AUTH
-static BOOL (*orig_laCan)(id, SEL, NSInteger, NSError **);
-static BOOL my_laCan(id self, SEL _cmd, NSInteger policy, NSError **err) {
-    NSError *local = nil;
+static BOOL (*orig_laCan)(id, SEL, NSInteger, NSError * __autoreleasing *);
+static BOOL my_laCan(id self, SEL _cmd, NSInteger policy, NSError * __autoreleasing *err) {
+    NSError * __autoreleasing local = nil;
     BOOL r = orig_laCan(self, _cmd, policy, err ? err : &local);
     NSError *e = r ? nil : (err ? *err : local);
     LCLog(@"LAContext canEvaluatePolicy policy=%ld -> %@ errcode=%ld",
@@ -2484,20 +2484,16 @@ static void lc_init(void) {
     }
 
     // Hook framework opsional & simpan cookie saat app masuk background / selesai launch.
-    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-    [nc addObserverForName:UIApplicationWillFinishLaunchingNotification
-                    object:nil
-                     queue:[NSOperationQueue mainQueue]
-                usingBlock:^(NSNotification *n) {
-        (void)n;
-        LCLog(@"WillFinishLaunching container=%@ home=%@", getContainerID(), NSHomeDirectory());
+    dispatch_async(dispatch_get_main_queue(), ^{
         installDeferredHooks();
-    }];
+    });
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
     [nc addObserverForName:UIApplicationDidFinishLaunchingNotification
                     object:nil
                      queue:[NSOperationQueue mainQueue]
                 usingBlock:^(NSNotification *n) {
         (void)n;
+        LCLog(@"DidFinishLaunching container=%@ home=%@", getContainerID(), NSHomeDirectory());
         installDeferredHooks();
     }];
 #if LC_ISOLATE_WEB_NET
